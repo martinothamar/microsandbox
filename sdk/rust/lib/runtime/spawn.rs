@@ -39,7 +39,7 @@ use tempfile::TempDir;
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::{NamedPipeServer, PipeMode, ServerOptions};
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt},
     process::Command,
 };
 #[cfg(windows)]
@@ -591,7 +591,7 @@ pub async fn spawn_sandbox(
     #[cfg(unix)]
     if startup_pipe.is_some() {
         cmd.stdout(Stdio::null());
-        cmd.stderr(Stdio::null());
+        cmd.stderr(Stdio::piped());
     } else {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::inherit());
@@ -661,23 +661,25 @@ pub async fn spawn_sandbox(
     {
         Ok(Ok(line)) => line,
         Ok(Err(err)) => {
-            terminate_startup_process(&mut child).await;
+            let (_, stderr) = terminate_startup_process_with_stderr(&mut child).await;
             release_metrics_reservation(config, metrics_reservation.as_ref());
-            return Err(err);
+            return Err(crate::MicrosandboxError::Runtime(format!(
+                "{err}; sandbox stderr: {stderr:?}"
+            )));
         }
         Err(_) => {
-            terminate_startup_process(&mut child).await;
+            let (_, stderr) = terminate_startup_process_with_stderr(&mut child).await;
             release_metrics_reservation(config, metrics_reservation.as_ref());
-            return Err(crate::MicrosandboxError::Runtime(
-                "sandbox startup timeout: no JSON received within 30 seconds".into(),
-            ));
+            return Err(crate::MicrosandboxError::Runtime(format!(
+                "sandbox startup timeout: no JSON received within 30 seconds; sandbox stderr: {stderr:?}"
+            )));
         }
     };
 
     let startup: StartupInfo = match serde_json::from_str(line.trim()) {
         Ok(info) => info,
         Err(_) => {
-            let status = terminate_startup_process(&mut child).await;
+            let (status, stderr) = terminate_startup_process_with_stderr(&mut child).await;
             release_metrics_reservation(config, metrics_reservation.as_ref());
             tracing::debug!(
                 raw_line = ?line,
@@ -686,7 +688,7 @@ pub async fn spawn_sandbox(
             );
             return Err(crate::MicrosandboxError::Runtime(format!(
                 "sandbox process exited ({status:?}) before sending startup info \
-                 (line: {line:?}, check stderr above for details)"
+                 (line: {line:?}, stderr: {stderr:?})"
             )));
         }
     };
@@ -2110,6 +2112,27 @@ async fn terminate_startup_process(
 ) -> Option<std::process::ExitStatus> {
     let _ = child.start_kill();
     child.wait().await.ok()
+}
+
+async fn terminate_startup_process_with_stderr(
+    child: &mut tokio::process::Child,
+) -> (Option<std::process::ExitStatus>, String) {
+    let stderr = child.stderr.take();
+    tokio::join!(
+        terminate_startup_process(child),
+        read_startup_stderr(stderr)
+    )
+}
+
+async fn read_startup_stderr(stderr: Option<tokio::process::ChildStderr>) -> String {
+    let Some(stderr) = stderr else {
+        return String::new();
+    };
+    let mut bytes = Vec::new();
+    match stderr.take(64 * 1024).read_to_end(&mut bytes).await {
+        Ok(_) => String::from_utf8_lossy(&bytes).trim().to_string(),
+        Err(error) => format!("failed to read sandbox stderr: {error}"),
+    }
 }
 
 /// Scan `config.spec.mounts` for file bind mounts and stage each file in its own
