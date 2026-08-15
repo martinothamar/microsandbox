@@ -585,6 +585,7 @@ impl SandboxHandle {
 
     /// Wait until this sandbox is observed in a terminal non-running state.
     pub async fn wait_until_stopped(&self) -> MicrosandboxResult<SandboxStopResult> {
+        let expected_pid = self.local().and_then(|state| state.pid);
         loop {
             let current = match self.refresh().await {
                 Ok(current) => current,
@@ -597,7 +598,24 @@ impl SandboxHandle {
                 Err(error) => return Err(error),
             };
             let status = current.status_snapshot();
+            if expected_pid
+                .zip(current.local().and_then(|state| state.pid))
+                .is_some_and(|(expected, current)| current != expected)
+            {
+                return Ok(SandboxStopResult {
+                    name: current.name,
+                    status: SandboxStatus::Stopped,
+                    exit_code: None,
+                    signal: None,
+                    observed_at: chrono::Utc::now(),
+                    source: Some("previous local runtime generation exited".to_string()),
+                });
+            }
             if sandbox_status_is_terminal(status) {
+                if expected_pid.is_some_and(microsandbox_utils::process::pid_is_alive) {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
                 return Ok(SandboxStopResult {
                     name: current.name,
                     status,

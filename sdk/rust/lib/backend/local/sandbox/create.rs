@@ -491,7 +491,7 @@ impl LocalBackend {
             );
         }
         let handle = if matches!(mode, SpawnMode::Detached) {
-            handle.disarm();
+            handle.detach_and_reap();
             None
         } else {
             Some(Arc::new(Mutex::new(handle)))

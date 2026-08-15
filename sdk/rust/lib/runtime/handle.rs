@@ -213,6 +213,22 @@ impl ProcessHandle {
         }
     }
 
+    /// Detach the sandbox lifecycle while retaining an asynchronous child
+    /// waiter so the runtime cannot remain as a zombie process.
+    pub(crate) fn detach_and_reap(mut self) {
+        self.disarm();
+        tokio::spawn(async move {
+            if let Err(error) = self.wait().await {
+                tracing::warn!(
+                    error = %error,
+                    pid = self.pid,
+                    sandbox = %self.sandbox_name,
+                    "failed to reap detached sandbox runtime"
+                );
+            }
+        });
+    }
+
     fn cleanup_metrics_reservation(&mut self) {
         let Some(metrics_reservation) = self.metrics_reservation.take() else {
             return;

@@ -819,6 +819,16 @@ impl Sandbox {
 
     /// Stop the sandbox gracefully with an explicit timeout before escalation.
     pub async fn stop_with_timeout(&self, timeout: std::time::Duration) -> MicrosandboxResult<()> {
+        if !self.owns_lifecycle() {
+            return self
+                .backend
+                .sandboxes()
+                .get(self.backend.clone(), &self.name)
+                .await?
+                .stop_with_timeout(timeout)
+                .await;
+        }
+
         if timeout.is_zero() {
             self.kill_with_timeout(DEFAULT_KILL_TIMEOUT).await?;
             return Ok(());
@@ -886,6 +896,16 @@ impl Sandbox {
     /// the agent shutdown path. Cloud sandboxes currently return `Unsupported`.
     /// Force-kill the sandbox and wait up to `timeout` for stopped-state observation.
     pub async fn kill_with_timeout(&self, timeout: std::time::Duration) -> MicrosandboxResult<()> {
+        if !self.owns_lifecycle() {
+            return self
+                .backend
+                .sandboxes()
+                .get(self.backend.clone(), &self.name)
+                .await?
+                .kill_with_timeout(timeout)
+                .await;
+        }
+
         self.request_kill().await?;
         match tokio::time::timeout(timeout, self.wait_until_stopped()).await {
             Ok(result) => {
