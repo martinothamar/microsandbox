@@ -31,7 +31,9 @@ use super::attach;
 use super::terminal::{
     WindowsTerminalEvent, WindowsTerminalEventPump, WindowsTerminalGuard, current_terminal_size,
 };
-use crate::sandbox::exec::{ExecControl, ExecEvent, ExecOptions, ExecSink, StdinMode};
+use crate::sandbox::exec::{
+    ExecControl, ExecEvent, ExecOptions, ExecSink, StdinMode, TerminalSize,
+};
 use crate::{MicrosandboxError, MicrosandboxResult, Sandbox, agent::AgentClient, error::Operation};
 
 //--------------------------------------------------------------------------------------------------
@@ -1017,18 +1019,18 @@ impl SshSession {
             timeout: None,
             stdin: StdinMode::Pipe,
             tty: pty.is_some(),
+            terminal_size: pty.as_ref().map(|pty| TerminalSize {
+                rows: pty.rows,
+                cols: pty.cols,
+            }),
             rlimits: Vec::new(),
         };
-        let rows = pty.as_ref().map(|p| p.rows).unwrap_or(24);
-        let cols = pty.as_ref().map(|p| p.cols).unwrap_or(80);
-        let handle = crate::sandbox::exec::agent::exec_stream_with_pty_size(
+        let handle = crate::sandbox::exec::agent::exec_stream(
             self.settings.sandbox.backend().as_ref(),
             self.settings.sandbox.name(),
             self.settings.sandbox.config(),
             cmd,
             opts,
-            rows,
-            cols,
         )
         .await?;
         let (control, stdin, mut events) = handle.into_parts();
