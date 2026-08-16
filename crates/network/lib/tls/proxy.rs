@@ -18,6 +18,9 @@ use tokio::sync::mpsc;
 use super::sni;
 use super::state::TlsState;
 use crate::conn::ProxyConnectState;
+use crate::control::{
+    NetworkControlClient, NetworkGrant, NetworkOperation, TransportProtocol, wait_for_revocation,
+};
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::proxy::connect_upstream;
 use crate::secrets::config::ViolationAction;
@@ -45,6 +48,10 @@ pub(crate) struct TlsProxyContext {
     pub(crate) tls_state: Arc<TlsState>,
     pub(crate) network_policy: Arc<NetworkPolicy>,
     pub(crate) proxy_connect: Arc<ProxyConnectState>,
+    /// Host controller used for connection and request authorization.
+    pub(crate) controller: Option<NetworkControlClient>,
+    /// Existing transport grant when the TLS connection arrived through the TCP proxy.
+    pub(crate) control_grant: Option<NetworkGrant>,
     /// Pre-connected upstream; when `Some`, skips dialing `connect_dst`.
     pub(crate) upstream_stream: Option<TcpStream>,
     /// Hostname from a CONNECT authority that must match the ClientHello SNI.
@@ -72,6 +79,7 @@ pub fn spawn_tls_proxy(
     tls_state: Arc<TlsState>,
     network_policy: Arc<NetworkPolicy>,
     proxy_connect: Arc<ProxyConnectState>,
+    controller: Option<NetworkControlClient>,
 ) {
     handle.spawn(async move {
         let context = TlsProxyContext {
@@ -81,6 +89,8 @@ pub fn spawn_tls_proxy(
             tls_state,
             network_policy,
             proxy_connect,
+            controller,
+            control_grant: None,
             upstream_stream: None,
             expected_sni: None,
             via_connect: false,
@@ -106,6 +116,8 @@ pub(crate) async fn tls_proxy_task(
         tls_state,
         network_policy,
         proxy_connect,
+        controller,
+        mut control_grant,
         upstream_stream,
         expected_sni,
         via_connect,
@@ -156,6 +168,28 @@ pub(crate) async fn tls_proxy_task(
         return Ok(());
     }
 
+    if control_grant.is_none()
+        && let Some(controller) = controller.as_ref()
+    {
+        match controller
+            .authorize(NetworkOperation::Connect {
+                source: None,
+                destination: guest_dst,
+                transport: TransportProtocol::Tcp,
+                hostname: Some(sni_name.clone()),
+            })
+            .await
+        {
+            Ok(grant) => control_grant = Some(grant),
+            Err(error) => {
+                tracing::debug!(dst = %guest_dst, %error, "TLS egress denied by host controller");
+                proxy_connect.mark_policy_denied();
+                shared.proxy_wake.wake();
+                return Ok(());
+            }
+        }
+    }
+
     if tls_state.should_bypass(&sni_name) {
         tracing::debug!(sni = %sni_name, dst = %connect_dst, guest_dst = %guest_dst, "TLS bypass");
         bypass_relay(
@@ -166,6 +200,7 @@ pub(crate) async fn tls_proxy_task(
             shared,
             proxy_connect,
             upstream_stream,
+            control_grant,
         )
         .await
     } else {
@@ -182,12 +217,15 @@ pub(crate) async fn tls_proxy_task(
             tls_state,
             proxy_connect,
             upstream_stream,
+            controller,
+            control_grant,
         )
         .await
     }
 }
 
 /// Bypass mode: plain TCP splice, no TLS termination.
+#[allow(clippy::too_many_arguments)]
 async fn bypass_relay(
     dst: SocketAddr,
     initial_buf: Vec<u8>,
@@ -196,6 +234,7 @@ async fn bypass_relay(
     shared: Arc<SharedState>,
     proxy_connect: Arc<ProxyConnectState>,
     upstream_stream: Option<TcpStream>,
+    mut control_grant: Option<NetworkGrant>,
 ) -> io::Result<()> {
     let mut server = match upstream_stream {
         Some(s) => s,
@@ -209,6 +248,10 @@ async fn bypass_relay(
     let mut guest_eof = false;
     loop {
         tokio::select! {
+            () = wait_for_revocation(&mut control_grant) => {
+                tracing::debug!(dst = %dst, "TLS flow revoked by host controller");
+                break;
+            }
             data = from_smoltcp.recv(), if !guest_eof => {
                 match data {
                     Some(bytes) => server_tx.write_all(&bytes).await?,
@@ -254,6 +297,8 @@ pub(crate) async fn intercept_relay(
     tls_state: Arc<TlsState>,
     proxy_connect: Arc<ProxyConnectState>,
     upstream_stream: Option<TcpStream>,
+    controller: Option<NetworkControlClient>,
+    mut control_grant: Option<NetworkGrant>,
 ) -> io::Result<()> {
     // Per-connection snapshot: live secret updates apply to later connections.
     let secrets = tls_state.secrets.load();
@@ -263,6 +308,9 @@ pub(crate) async fn intercept_relay(
         SecretsHandler::new_tls_intercepted(&secrets, sni_name, guest_dst.ip(), &shared)
     }
     .with_guest_dst(guest_dst);
+    if controller.is_some() {
+        secrets_handler = secrets_handler.observe_http_requests();
+    }
 
     // Get or generate per-domain certificate (includes cached ServerConfig).
     let domain_cert = tls_state
@@ -336,6 +384,8 @@ pub(crate) async fn intercept_relay(
         &mut guest_tls,
         &mut server_tls,
         &mut secrets_handler,
+        controller.as_ref(),
+        guest_dst,
         &shared,
         &mut plaintext_buf,
     )
@@ -344,6 +394,10 @@ pub(crate) async fn intercept_relay(
     let mut guest_eof = false;
     loop {
         tokio::select! {
+            () = wait_for_revocation(&mut control_grant) => {
+                tracing::debug!(dst = %guest_dst, "TLS flow revoked by host controller");
+                break;
+            }
             // Guest → server: receive encrypted, decrypt, forward plaintext.
             data = from_smoltcp.recv(), if !guest_eof => {
                 let data = match data {
@@ -374,6 +428,8 @@ pub(crate) async fn intercept_relay(
                         &mut guest_tls,
                         &mut server_tls,
                         &mut secrets_handler,
+                        controller.as_ref(),
+                        guest_dst,
                         &shared,
                         &mut plaintext_buf,
                     )
@@ -447,6 +503,8 @@ async fn forward_plaintext(
     guest_tls: &mut rustls::ServerConnection,
     server_tls: &mut tokio_rustls::client::TlsStream<TcpStream>,
     secrets_handler: &mut SecretsHandler,
+    controller: Option<&NetworkControlClient>,
+    guest_dst: SocketAddr,
     shared: &SharedState,
     buf: &mut [u8],
 ) -> io::Result<()> {
@@ -468,6 +526,8 @@ async fn forward_plaintext(
 
         match secrets_handler.substitute(&buf[..n]) {
             Ok(data) => {
+                crate::proxy::authorize_http_requests(controller, guest_dst, secrets_handler)
+                    .await?;
                 if !data.is_empty() {
                     server_tls.write_all(&data).await?;
                     wrote_plaintext = true;

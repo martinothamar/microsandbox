@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -22,12 +23,13 @@ use tokio::sync::{mpsc, oneshot, watch};
 //--------------------------------------------------------------------------------------------------
 
 /// Stable protocol selected by compatible Sandbox and Network Backends.
-pub const NETWORK_CONTROL_PROTOCOL: &str = "microsandbox.network-control.v1";
+pub const NETWORK_CONTROL_PROTOCOL: &str = "microsandbox.network-control.v2";
 
 /// Maximum serialized control message accepted from either peer.
 pub const MAX_CONTROL_MESSAGE_LENGTH: usize = 64 * 1024;
 
 const COMMAND_CAPACITY: usize = 256;
+const HOST_CHANNEL_CAPACITY: usize = 256;
 const AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -47,6 +49,26 @@ pub enum TransportProtocol {
     Icmpv4,
     /// Internet Control Message Protocol for IPv6.
     Icmpv6,
+}
+
+/// Scheme of a request observed by trusted protocol inspection.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HttpScheme {
+    /// Plaintext HTTP.
+    Http,
+    /// HTTP carried through intercepted TLS.
+    Https,
+}
+
+/// HTTP framing version observed by the trusted runtime.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HttpVersion {
+    /// HTTP/1.0 or HTTP/1.1 framing.
+    Http1,
+    /// HTTP/2 framing.
+    Http2,
 }
 
 /// Trusted outbound operation described by the Microsandbox network engine.
@@ -76,6 +98,24 @@ pub enum NetworkOperation {
         resolver: Option<SocketAddr>,
         /// UDP or TCP transport used by the query.
         transport: TransportProtocol,
+    },
+    /// Authorize one HTTP request before forwarding its bytes upstream.
+    HttpRequest {
+        /// Original transport destination requested by the Sandbox.
+        destination: SocketAddr,
+        /// Plaintext or intercepted-TLS scheme.
+        scheme: HttpScheme,
+        /// Request authority reported by trusted protocol parsing.
+        authority: String,
+        /// HTTP method.
+        method: String,
+        /// Request path with its query removed.
+        path: String,
+        /// HTTP framing version.
+        version: HttpVersion,
+        /// HTTP/2 stream identifier, absent for HTTP/1.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_id: Option<u32>,
     },
 }
 
@@ -203,6 +243,44 @@ struct Connection {
     writer: tokio::io::WriteHalf<PlatformStream>,
 }
 
+/// Host-owned endpoint for one controlled Sandbox runtime.
+///
+/// The endpoint owns platform-specific binding, framing, reconnection and
+/// cleanup. Consumers use the bounded channels returned by [`Self::into_parts`]
+/// without handling Unix sockets or Windows named pipes themselves.
+pub struct NetworkControlHost {
+    incoming: NetworkControlIncoming,
+    outgoing: mpsc::Sender<Bytes>,
+}
+
+/// Bounded host-side channels for a controlled Sandbox runtime.
+pub struct NetworkControlHostParts {
+    /// Complete protocol messages emitted by the trusted runtime.
+    pub incoming: NetworkControlIncoming,
+    /// Complete protocol messages sent back to the trusted runtime.
+    pub outgoing: mpsc::Sender<Bytes>,
+}
+
+/// Receiver for complete runtime protocol messages.
+///
+/// Dropping this value closes the endpoint and removes its Unix socket.
+pub struct NetworkControlIncoming {
+    receiver: mpsc::Receiver<Bytes>,
+    shutdown: Option<oneshot::Sender<()>>,
+}
+
+#[cfg(unix)]
+type HostListener = tokio::net::UnixListener;
+
+#[cfg(unix)]
+type HostConnection = tokio::net::UnixStream;
+
+#[cfg(windows)]
+type HostListener = tokio::net::windows::named_pipe::NamedPipeServer;
+
+#[cfg(windows)]
+type HostConnection = tokio::net::windows::named_pipe::NamedPipeServer;
+
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
@@ -265,6 +343,62 @@ impl NetworkControlClient {
     }
 }
 
+impl NetworkControlHost {
+    /// Binds the stable local endpoint used by one controlled Sandbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the endpoint cannot be created or a non-socket
+    /// filesystem object already occupies its Unix path.
+    pub async fn bind(endpoint: PathBuf) -> io::Result<Self> {
+        let listener = bind_host_listener(&endpoint)?;
+        let (incoming_tx, incoming_rx) = mpsc::channel(HOST_CHANNEL_CAPACITY);
+        let (outgoing_tx, outgoing_rx) = mpsc::channel(HOST_CHANNEL_CAPACITY);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        tokio::spawn(run_host_listener(
+            listener,
+            endpoint,
+            incoming_tx,
+            outgoing_rx,
+            shutdown_rx,
+        ));
+        Ok(Self {
+            incoming: NetworkControlIncoming {
+                receiver: incoming_rx,
+                shutdown: Some(shutdown_tx),
+            },
+            outgoing: outgoing_tx,
+        })
+    }
+
+    /// Splits the endpoint into independently driven bounded directions.
+    #[must_use]
+    pub fn into_parts(self) -> NetworkControlHostParts {
+        NetworkControlHostParts {
+            incoming: self.incoming,
+            outgoing: self.outgoing,
+        }
+    }
+}
+
+impl NetworkControlIncoming {
+    /// Polls for one complete runtime protocol message.
+    pub fn poll_recv(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Bytes>> {
+        self.receiver.poll_recv(context)
+    }
+}
+
+impl Drop for NetworkControlIncoming {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+}
+
 impl NetworkGrant {
     /// Completes when the host revokes this flow or the controller disconnects.
     pub async fn revoked(&mut self) {
@@ -293,6 +427,168 @@ pub(crate) async fn wait_for_revocation(grant: &mut Option<NetworkGrant>) {
         Some(grant) => grant.revoked().await,
         None => std::future::pending().await,
     }
+}
+
+#[cfg(unix)]
+fn bind_host_listener(endpoint: &Path) -> io::Result<HostListener> {
+    use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
+
+    let parent = endpoint.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Network control endpoint has no parent directory",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    match std::fs::symlink_metadata(endpoint) {
+        Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(endpoint)?,
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "refusing to replace non-socket Network control endpoint {}",
+                    endpoint.display()
+                ),
+            ));
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => return Err(source),
+    }
+    tokio::net::UnixListener::bind(endpoint)
+}
+
+#[cfg(windows)]
+fn bind_host_listener(endpoint: &Path) -> io::Result<HostListener> {
+    tokio::net::windows::named_pipe::ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(endpoint)
+}
+
+#[cfg(unix)]
+#[allow(clippy::needless_pass_by_ref_mut)]
+async fn accept_host_connection(
+    listener: &mut HostListener,
+    _endpoint: &Path,
+) -> io::Result<HostConnection> {
+    listener.accept().await.map(|(connection, _)| connection)
+}
+
+#[cfg(windows)]
+async fn accept_host_connection(
+    listener: &mut HostListener,
+    endpoint: &Path,
+) -> io::Result<HostConnection> {
+    listener.connect().await?;
+    Ok(std::mem::replace(
+        listener,
+        tokio::net::windows::named_pipe::ServerOptions::new().create(endpoint)?,
+    ))
+}
+
+async fn run_host_listener(
+    mut listener: HostListener,
+    endpoint: PathBuf,
+    incoming: mpsc::Sender<Bytes>,
+    mut outgoing: mpsc::Receiver<Bytes>,
+    mut shutdown: oneshot::Receiver<()>,
+) {
+    let _cleanup = HostEndpointCleanup(endpoint.clone());
+    loop {
+        let connection = tokio::select! {
+            result = accept_host_connection(&mut listener, &endpoint) => match result {
+                Ok(connection) => connection,
+                Err(error) => {
+                    tracing::warn!(%error, endpoint = %endpoint.display(), "Network control endpoint accept failed");
+                    break;
+                }
+            },
+            _ = &mut shutdown => break,
+        };
+        if let Err(error) =
+            run_host_connection(connection, &incoming, &mut outgoing, &mut shutdown).await
+        {
+            tracing::debug!(%error, "Network control connection closed");
+        }
+        while outgoing.try_recv().is_ok() {}
+    }
+}
+
+async fn run_host_connection(
+    connection: HostConnection,
+    incoming: &mpsc::Sender<Bytes>,
+    outgoing: &mut mpsc::Receiver<Bytes>,
+    shutdown: &mut oneshot::Receiver<()>,
+) -> io::Result<()> {
+    let (mut reader, mut writer) = tokio::io::split(connection);
+    loop {
+        tokio::select! {
+            message = read_frame(&mut reader) => match message? {
+                Some(message) => incoming
+                    .send(message)
+                    .await
+                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Network controller stopped"))?,
+                None => return Ok(()),
+            },
+            message = outgoing.recv() => match message {
+                Some(message) => write_frame(&mut writer, &message).await?,
+                None => return Ok(()),
+            },
+            _ = &mut *shutdown => return Ok(()),
+        }
+    }
+}
+
+async fn read_frame<R>(reader: &mut R) -> io::Result<Option<Bytes>>
+where
+    R: AsyncRead + Unpin,
+{
+    let length = match reader.read_u32().await {
+        Ok(length) => length as usize,
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if length > MAX_CONTROL_MESSAGE_LENGTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Network control message is too large",
+        ));
+    }
+    let mut payload = vec![0; length];
+    reader.read_exact(&mut payload).await?;
+    Ok(Some(Bytes::from(payload)))
+}
+
+async fn write_frame<W>(writer: &mut W, payload: &[u8]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let length = u32::try_from(payload.len())
+        .ok()
+        .filter(|length| *length as usize <= MAX_CONTROL_MESSAGE_LENGTH)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Network control message is too large",
+            )
+        })?;
+    writer.write_u32(length).await?;
+    writer.write_all(payload).await?;
+    writer.flush().await
+}
+
+struct HostEndpointCleanup(PathBuf);
+
+#[cfg(unix)]
+impl Drop for HostEndpointCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(windows)]
+impl Drop for HostEndpointCleanup {
+    fn drop(&mut self) {}
 }
 
 async fn run_client(endpoint: PathBuf, mut commands: mpsc::Receiver<Command>) {
@@ -590,5 +886,31 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn request_authorization_round_trips_http2_metadata() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        let expected = RuntimeMessage::AuthorizationRequest {
+            request_id: 11,
+            flow_id: 12,
+            operation: NetworkOperation::HttpRequest {
+                destination: "198.51.100.10:443".parse().unwrap(),
+                scheme: HttpScheme::Https,
+                authority: "example.com".to_string(),
+                method: "GET".to_string(),
+                path: "/items".to_string(),
+                version: HttpVersion::Http2,
+                stream_id: Some(3),
+            },
+        };
+
+        write_message(&mut writer, &expected).await.unwrap();
+        let actual = read_message::<_, RuntimeMessage>(&mut reader)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(actual, expected);
     }
 }

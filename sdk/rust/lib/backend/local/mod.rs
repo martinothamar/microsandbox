@@ -220,8 +220,8 @@ impl LocalBackend {
 
     /// Enables or disables host-controlled networking for a local Sandbox.
     ///
-    /// This is a local embedding hook. The caller must bind the endpoint
-    /// returned by [`Self::network_control_endpoint`] before starting the
+    /// This is a local embedding hook. The caller must bind the controller
+    /// returned by [`Self::bind_network_controller`] before starting the
     /// Sandbox. A selected controller that is absent or unresponsive causes
     /// outbound operations to fail closed.
     #[cfg(feature = "net")]
@@ -238,12 +238,25 @@ impl LocalBackend {
         }
     }
 
-    /// Returns the local endpoint a selected Network controller must bind.
+    /// Binds the local controller endpoint for one selected Sandbox.
+    ///
+    /// The returned value owns platform-specific IPC, bounded framing,
+    /// reconnection and endpoint cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the local endpoint cannot be bound safely.
     #[cfg(feature = "net")]
-    pub fn network_control_endpoint(&self, name: &str) -> PathBuf {
+    pub async fn bind_network_controller(
+        &self,
+        name: &str,
+    ) -> crate::MicrosandboxResult<microsandbox_network::control::NetworkControlHost> {
         let agent =
             microsandbox_runtime::ipc::canonical_agent_endpoint(&self.config.run_dir(), name);
-        microsandbox_runtime::ipc::network_control_endpoint_for(&agent)
+        let endpoint = microsandbox_runtime::ipc::network_control_endpoint_for(&agent);
+        microsandbox_network::control::NetworkControlHost::bind(endpoint)
+            .await
+            .map_err(Into::into)
     }
 
     #[cfg(feature = "net")]

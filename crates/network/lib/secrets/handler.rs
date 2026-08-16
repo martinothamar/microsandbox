@@ -108,6 +108,45 @@ pub struct SecretsHandler {
     unsupported_body_tail: Vec<u8>,
     /// HTTP/2 parser/rewriter state once an HTTP/2 preface is observed.
     http2_state: Option<Http2State>,
+    /// Whether complete request headers must be reported before forwarding.
+    observe_http_requests: bool,
+    /// Complete requests discovered by the latest substitution calls.
+    observed_http_requests: Vec<ObservedHttpRequest>,
+}
+
+/// Trusted metadata for one complete HTTP request header block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObservedHttpRequest {
+    /// `http` for plaintext traffic and `https` for intercepted TLS.
+    pub scheme: HttpScheme,
+    /// Request authority without interpretation by the policy layer.
+    pub authority: String,
+    /// HTTP method.
+    pub method: String,
+    /// Request path with its query removed.
+    pub path: String,
+    /// Parsed protocol version.
+    pub version: HttpVersion,
+    /// HTTP/2 stream identifier, absent for HTTP/1.
+    pub stream_id: Option<u32>,
+}
+
+/// Scheme observed by the trusted HTTP parser.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HttpScheme {
+    /// Plaintext HTTP.
+    Http,
+    /// HTTP carried through intercepted TLS.
+    Https,
+}
+
+/// HTTP framing version observed by the trusted parser.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HttpVersion {
+    /// HTTP/1.0 or HTTP/1.1 framing.
+    Http1,
+    /// HTTP/2 framing.
+    Http2,
 }
 
 /// HTTP request framing state for the guest→server byte stream.
@@ -643,6 +682,8 @@ impl SecretsHandler {
             http_pending: Vec::new(),
             unsupported_body_tail: Vec::new(),
             http2_state: None,
+            observe_http_requests: false,
+            observed_http_requests: Vec::new(),
         }
     }
 
@@ -650,6 +691,18 @@ impl SecretsHandler {
     pub fn with_guest_dst(mut self, guest_dst: SocketAddr) -> Self {
         self.guest_dst = Some(guest_dst);
         self
+    }
+
+    /// Enables trusted request-boundary observation for host authorization.
+    #[must_use]
+    pub fn observe_http_requests(mut self) -> Self {
+        self.observe_http_requests = true;
+        self
+    }
+
+    /// Removes and returns requests discovered since the previous call.
+    pub fn take_observed_http_requests(&mut self) -> Vec<ObservedHttpRequest> {
+        std::mem::take(&mut self.observed_http_requests)
     }
 
     /// Substitute secrets in plaintext data (guest → server direction).
@@ -789,6 +842,7 @@ impl SecretsHandler {
             {
                 return Err(ViolationAction::Block);
             }
+            self.observe_request(&request_summary, HttpVersion::Http1, None)?;
 
             let transfer_encoding = parse_transfer_encoding(header_text.as_ref())?;
             if transfer_encoding.is_some() && parse_content_length(header_text.as_ref())?.is_some()
@@ -1229,7 +1283,8 @@ impl SecretsHandler {
 
     /// Returns true if this connection needs no secret substitution or violation detection.
     pub fn is_empty(&self) -> bool {
-        self.http_sni.is_none()
+        !self.observe_http_requests
+            && self.http_sni.is_none()
             && self.http_pending.is_empty()
             && self.unsupported_body_tail.is_empty()
             && self.http1_request_summary.is_none()
@@ -1243,6 +1298,39 @@ impl SecretsHandler {
         self.eligible_for_substitution.iter().any(|secret| {
             secret.inject_body && (!secret.require_tls_identity || self.tls_intercepted)
         })
+    }
+
+    fn observe_request(
+        &mut self,
+        summary: &RequestSummary,
+        version: HttpVersion,
+        stream_id: Option<u32>,
+    ) -> Result<(), ViolationAction> {
+        if !self.observe_http_requests {
+            return Ok(());
+        }
+        let authority = summary
+            .host
+            .as_ref()
+            .filter(|authority| !authority.is_empty())
+            .cloned()
+            .or_else(|| (!self.sni.is_empty()).then(|| self.sni.clone()))
+            .ok_or(ViolationAction::Block)?;
+        let method = summary.method.clone().ok_or(ViolationAction::Block)?;
+        let path = summary.path.clone().ok_or(ViolationAction::Block)?;
+        self.observed_http_requests.push(ObservedHttpRequest {
+            scheme: if self.tls_intercepted {
+                HttpScheme::Https
+            } else {
+                HttpScheme::Http
+            },
+            authority,
+            method,
+            path,
+            version,
+            stream_id,
+        });
+        Ok(())
     }
 
     fn block_unsupported_body_placeholder(
@@ -1777,6 +1865,9 @@ impl Http2State {
         let detection_bytes = http2_header_detection_bytes(&headers);
         let detection_text = String::from_utf8_lossy(&detection_bytes);
         let request_summary = http2_request_summary(detection_text.as_ref());
+        if is_initial_request {
+            handler.observe_request(&request_summary, HttpVersion::Http2, Some(block.stream_id))?;
+        }
         handler.apply_blocking_action(detect_blocking_action_with_tail(
             &handler.ineligible_for_substitution,
             &[],
@@ -3246,6 +3337,76 @@ mod tests {
             .map(|(_, value)| value.as_slice())
             .expect("header present");
         String::from_utf8(value.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn observes_pipelined_http1_requests_without_secrets() {
+        let config = make_config(Vec::new());
+        let shared = SharedState::new(16);
+        let mut handler = SecretsHandler::new_plain_http(
+            &config,
+            "example.com",
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+            &shared,
+        )
+        .observe_http_requests();
+        let input = b"GET /one?credential=hidden HTTP/1.1\r\nHost: example.com\r\n\r\nPOST /two HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n";
+
+        assert_eq!(handler.substitute(input).unwrap().as_ref(), input);
+        assert_eq!(
+            handler.take_observed_http_requests(),
+            vec![
+                ObservedHttpRequest {
+                    scheme: HttpScheme::Http,
+                    authority: "example.com".to_string(),
+                    method: "GET".to_string(),
+                    path: "/one".to_string(),
+                    version: HttpVersion::Http1,
+                    stream_id: None,
+                },
+                ObservedHttpRequest {
+                    scheme: HttpScheme::Http,
+                    authority: "example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/two".to_string(),
+                    version: HttpVersion::Http1,
+                    stream_id: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn observes_intercepted_http2_request_without_secrets() {
+        let config = make_config(Vec::new());
+        let mut handler =
+            SecretsHandler::new_tls_intercepted_via_connect(&config, "api.example.com")
+                .observe_http_requests();
+        let request = h2_request(
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.example.com"),
+                (b":path", b"/v1/items?credential=hidden"),
+            ],
+            true,
+        );
+
+        assert_eq!(
+            handler.substitute(&request).unwrap().as_ref(),
+            request.as_slice()
+        );
+        assert_eq!(
+            handler.take_observed_http_requests(),
+            vec![ObservedHttpRequest {
+                scheme: HttpScheme::Https,
+                authority: "api.example.com".to_string(),
+                method: "GET".to_string(),
+                path: "/v1/items".to_string(),
+                version: HttpVersion::Http2,
+                stream_id: Some(1),
+            }]
+        );
     }
 
     #[test]

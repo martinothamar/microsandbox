@@ -18,12 +18,14 @@ use tokio::sync::mpsc;
 
 use crate::conn::ProxyConnectState;
 use crate::control::{
-    NetworkControlClient, NetworkOperation, TransportProtocol, wait_for_revocation,
+    HttpScheme as ControlHttpScheme, HttpVersion as ControlHttpVersion, NetworkControlClient,
+    NetworkOperation, TransportProtocol, wait_for_revocation,
 };
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::secrets::config::{SecretsConfig, SecretsConfigExt, ViolationAction};
 use crate::secrets::handler::{
-    SecretsHandler, first_line_is_not_http_request, looks_like_http_request_prefix,
+    HttpScheme, HttpVersion, SecretsHandler, first_line_is_not_http_request,
+    looks_like_http_request_prefix,
 };
 use crate::shared::SharedState;
 use crate::tls::proxy::{TlsProxyContext, tls_proxy_task};
@@ -239,7 +241,7 @@ async fn tcp_proxy_task(
         }
     }
 
-    let mut control_grant = if let Some(controller) = controller {
+    let mut control_grant = if let Some(controller) = controller.as_ref() {
         match controller
             .authorize(NetworkOperation::Connect {
                 source: None,
@@ -279,6 +281,8 @@ async fn tcp_proxy_task(
                 tls_state,
                 proxy_connect,
                 None,
+                controller,
+                control_grant,
             )
             .await;
         }
@@ -303,8 +307,10 @@ async fn tcp_proxy_task(
     // server→guest direction. When domain rules already peeked, `initial_buf`
     // is reused and this is cheap; with no secrets it is skipped entirely
     // (`is_tls` only matters for deciding whether to build the handler).
-    let want_headers = secrets.has_plain_http_candidates() || secrets.has_host_scoped_secrets();
-    let (initial_buf, is_tls) = if !secrets.secrets.is_empty() {
+    let want_headers = controller.is_some()
+        || secrets.has_plain_http_candidates()
+        || secrets.has_host_scoped_secrets();
+    let (initial_buf, is_tls) = if controller.is_some() || !secrets.secrets.is_empty() {
         classify_first_flight(
             initial_buf,
             &mut from_smoltcp,
@@ -341,15 +347,22 @@ async fn tcp_proxy_task(
             tls_state,
             proxy_connect,
             Some(proxy_stream),
+            controller,
+            control_grant,
         )
         .await;
     }
 
     let mut late_connect_state = tls_state;
-    let mut secrets_handler: Option<SecretsHandler> = if !secrets.secrets.is_empty() && !is_tls {
-        Some(match extract_http_host(&initial_buf) {
+    let mut secrets_handler: Option<SecretsHandler> = if want_headers && !is_tls {
+        let handler = match extract_http_host(&initial_buf) {
             Some(host) => SecretsHandler::new_plain_http(&secrets, &host, guest_dst.ip(), &shared),
             None => SecretsHandler::new_plain_http_invalid_host(&secrets),
+        };
+        Some(if controller.is_some() {
+            handler.observe_http_requests()
+        } else {
+            handler
         })
     } else {
         None
@@ -372,6 +385,9 @@ async fn tcp_proxy_task(
             },
             None => Cow::Borrowed(&initial_buf),
         };
+        if let Some(handler) = secrets_handler.as_mut() {
+            authorize_http_requests(controller.as_ref(), guest_dst, handler).await?;
+        }
         if !out.is_empty() {
             if let Err(e) = server_tx.write_all(&out).await {
                 tracing::debug!(dst = %connect_dst, error = %e, "replay of buffered first flight failed");
@@ -422,6 +438,8 @@ async fn tcp_proxy_task(
                                 tls_state,
                                 proxy_connect,
                                 Some(proxy_stream),
+                                controller,
+                                control_grant,
                             )
                             .await;
                         }
@@ -440,6 +458,16 @@ async fn tcp_proxy_task(
                             },
                             None => Cow::Borrowed(&bytes),
                         };
+                        if let Some(handler) = secrets_handler.as_mut()
+                            && let Err(error) = authorize_http_requests(
+                                controller.as_ref(),
+                                guest_dst,
+                                handler,
+                            ).await
+                        {
+                            tracing::debug!(dst = %guest_dst, %error, "HTTP request denied by Network controller");
+                            break;
+                        }
                         if !out.is_empty() {
                             if let Err(e) = server_tx.write_all(&out).await {
                                 tracing::debug!(dst = %connect_dst, error = %e, "write to server failed");
@@ -493,6 +521,47 @@ async fn tcp_proxy_task(
     Ok(())
 }
 
+/// Authorizes complete requests reported by the trusted HTTP parser.
+///
+/// Request grants are point-in-time permissions: dropping a grant after the
+/// headers are accepted closes its host-side bookkeeping, while the enclosing
+/// transport grant continues to support live flow revocation.
+pub(crate) async fn authorize_http_requests(
+    controller: Option<&NetworkControlClient>,
+    destination: SocketAddr,
+    handler: &mut SecretsHandler,
+) -> io::Result<()> {
+    let requests = handler.take_observed_http_requests();
+    let Some(controller) = controller else {
+        debug_assert!(requests.is_empty());
+        return Ok(());
+    };
+    for request in requests {
+        let scheme = match request.scheme {
+            HttpScheme::Http => ControlHttpScheme::Http,
+            HttpScheme::Https => ControlHttpScheme::Https,
+        };
+        let version = match request.version {
+            HttpVersion::Http1 => ControlHttpVersion::Http1,
+            HttpVersion::Http2 => ControlHttpVersion::Http2,
+        };
+        let grant = controller
+            .authorize(NetworkOperation::HttpRequest {
+                destination,
+                scheme,
+                authority: request.authority,
+                method: request.method,
+                path: request.path,
+                version,
+                stream_id: request.stream_id,
+            })
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
+        drop(grant);
+    }
+    Ok(())
+}
+
 /// Forward an HTTP CONNECT tunnel: dial the proxy, splice the handshake,
 /// then hand the established stream to `tls_proxy_task` for TLS MITM.
 ///
@@ -510,6 +579,8 @@ async fn handle_connect_tunnel(
     tls_state: Arc<TlsState>,
     proxy_connect: Arc<ProxyConnectState>,
     preconnected_proxy: Option<TcpStream>,
+    controller: Option<NetworkControlClient>,
+    control_grant: Option<crate::control::NetworkGrant>,
 ) -> io::Result<()> {
     let connect_req =
         parse_connect_request(buffer_connect_request(initial_buf, &mut from_smoltcp).await?)?;
@@ -572,7 +643,14 @@ async fn handle_connect_tunnel(
         }
         proxy_stream.flush().await?;
         proxy_connect.mark_connected();
-        return relay_connected_stream(proxy_stream, from_smoltcp, to_smoltcp, shared).await;
+        return relay_connected_stream(
+            proxy_stream,
+            from_smoltcp,
+            to_smoltcp,
+            shared,
+            control_grant,
+        )
+        .await;
     }
 
     proxy_stream.write_all(&connect_headers).await?;
@@ -614,6 +692,8 @@ async fn handle_connect_tunnel(
             tls_state,
             network_policy,
             proxy_connect,
+            controller,
+            control_grant,
             upstream_stream: Some(proxy_stream),
             via_connect: expected_sni.is_some(),
             expected_sni,
@@ -631,6 +711,7 @@ async fn relay_connected_stream(
     mut from_smoltcp: mpsc::Receiver<Bytes>,
     to_smoltcp: mpsc::Sender<Bytes>,
     shared: Arc<SharedState>,
+    mut control_grant: Option<crate::control::NetworkGrant>,
 ) -> io::Result<()> {
     let (mut server_rx, mut server_tx) = stream.into_split();
     let mut server_buf = vec![0u8; SERVER_READ_BUF_SIZE];
@@ -638,6 +719,10 @@ async fn relay_connected_stream(
     let mut guest_eof = false;
     loop {
         tokio::select! {
+            () = wait_for_revocation(&mut control_grant) => {
+                tracing::debug!("proxied TCP flow revoked by host controller");
+                break;
+            }
             data = from_smoltcp.recv(), if !guest_eof => {
                 match data {
                     Some(bytes) => {

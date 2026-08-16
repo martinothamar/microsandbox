@@ -521,18 +521,6 @@ pub fn smoltcp_poll_loop(
         // Detect newly-established connections and spawn proxy tasks.
         let new_conns = conn_tracker.take_new_connections(&mut sockets);
         for conn in new_conns {
-            let is_intercepted_tls = tls_state.as_ref().is_some_and(|tls_state| {
-                tls_state
-                    .config
-                    .intercepted_ports
-                    .contains(&conn.dst.port())
-            });
-            if controller.is_some() && is_intercepted_tls {
-                tracing::debug!(dst = %conn.dst, "protocol path is not available in controlled Network mode");
-                conn.proxy_connect.mark_policy_denied();
-                shared.proxy_wake.wake();
-                continue;
-            }
             if let Some(ref tls_state) = tls_state
                 && tls_state
                     .config
@@ -551,6 +539,7 @@ pub fn smoltcp_poll_loop(
                     tls_state.clone(),
                     network_policy.clone(),
                     conn.proxy_connect,
+                    controller.clone(),
                 );
                 continue;
             }
