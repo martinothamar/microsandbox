@@ -23,6 +23,7 @@ use smoltcp::wire::{
 
 use crate::config::{DnsConfig, PublishedPort};
 use crate::conn::ConnectionTracker;
+use crate::control::NetworkControlClient;
 use crate::device::SmoltcpDevice;
 use crate::dns::common::ports::DnsPortType;
 use crate::dns::{
@@ -235,6 +236,7 @@ pub fn smoltcp_poll_loop(
     max_connections: Option<usize>,
     tokio_handle: tokio::runtime::Handle,
     secrets: SecretsHandle,
+    controller: Option<NetworkControlClient>,
 ) {
     let mut device = SmoltcpDevice::new(shared.clone(), config.mtu);
     let mut iface = create_interface(&mut device, &config);
@@ -272,6 +274,7 @@ pub fn smoltcp_poll_loop(
         config.gateway,
         config.gateway_mac,
         config.guest_mac,
+        controller.clone(),
     );
     let mut port_publisher = PortPublisher::new(
         &published_ports,
@@ -291,6 +294,7 @@ pub fn smoltcp_poll_loop(
         config.guest_mac,
         config.mtu,
         tokio_handle.clone(),
+        controller.clone(),
     );
     let mut udp_fragments = Ipv4UdpFragmentReassembler::new();
     let mut ipv6_udp_fragments = Ipv6UdpFragmentReassembler::new();
@@ -299,6 +303,7 @@ pub fn smoltcp_poll_loop(
         config.gateway_mac,
         config.guest_mac,
         tokio_handle.clone(),
+        controller.clone(),
     );
 
     // Rate-limit cleanup operations: run at most once per second.
@@ -516,6 +521,18 @@ pub fn smoltcp_poll_loop(
         // Detect newly-established connections and spawn proxy tasks.
         let new_conns = conn_tracker.take_new_connections(&mut sockets);
         for conn in new_conns {
+            let is_intercepted_tls = tls_state.as_ref().is_some_and(|tls_state| {
+                tls_state
+                    .config
+                    .intercepted_ports
+                    .contains(&conn.dst.port())
+            });
+            if controller.is_some() && is_intercepted_tls {
+                tracing::debug!(dst = %conn.dst, "protocol path is not available in controlled Network mode");
+                conn.proxy_connect.mark_policy_denied();
+                shared.proxy_wake.wake();
+                continue;
+            }
             if let Some(ref tls_state) = tls_state
                 && tls_state
                     .config
@@ -602,6 +619,7 @@ pub fn smoltcp_poll_loop(
                 secrets.load(),
                 tls_state.clone(),
                 conn.proxy_connect,
+                controller.clone(),
             );
         }
 

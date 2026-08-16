@@ -24,6 +24,9 @@ use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
+use crate::control::{
+    NetworkControlClient, NetworkOperation, TransportProtocol, wait_for_revocation,
+};
 use crate::icmp_error::{construct_packet_too_big, ethernet_ip_payload};
 use crate::shared::SharedState;
 
@@ -95,6 +98,7 @@ pub struct UdpRelay {
     guest_mac: EthernetAddress,
     mtu: usize,
     tokio_handle: tokio::runtime::Handle,
+    controller: Option<NetworkControlClient>,
 }
 
 /// A single UDP relay session.
@@ -143,6 +147,7 @@ impl UdpRelay {
         guest_mac: [u8; 6],
         mtu: usize,
         tokio_handle: tokio::runtime::Handle,
+        controller: Option<NetworkControlClient>,
     ) -> Self {
         Self {
             shared,
@@ -151,6 +156,7 @@ impl UdpRelay {
             guest_mac: EthernetAddress(guest_mac),
             mtu,
             tokio_handle,
+            controller,
         }
     }
 
@@ -295,6 +301,7 @@ impl UdpRelay {
         let guest_mac = self.guest_mac;
         let mtu = self.mtu;
         let task_queued_bytes = queued_bytes.clone();
+        let controller = self.controller.clone();
 
         self.tokio_handle.spawn(async move {
             if let Err(e) = udp_relay_task(
@@ -307,6 +314,7 @@ impl UdpRelay {
                 gateway_mac,
                 guest_mac,
                 mtu,
+                controller,
             )
             .await
             {
@@ -400,7 +408,27 @@ async fn udp_relay_task(
     gateway_mac: EthernetAddress,
     guest_mac: EthernetAddress,
     mtu: usize,
+    controller: Option<NetworkControlClient>,
 ) -> std::io::Result<()> {
+    let mut control_grant = if let Some(controller) = controller {
+        match controller
+            .authorize(NetworkOperation::Connect {
+                source: Some(guest_src),
+                destination: guest_dst,
+                transport: TransportProtocol::Udp,
+                hostname: None,
+            })
+            .await
+        {
+            Ok(grant) => Some(grant),
+            Err(error) => {
+                tracing::debug!(dst = %guest_dst, %error, "UDP egress denied by host controller");
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
     let socket = open_udp_socket(host_dst)?;
     // Connect to the destination to restrict accepted source addresses,
     // preventing host-network entities from injecting spoofed datagrams.
@@ -412,6 +440,10 @@ async fn udp_relay_task(
 
     loop {
         tokio::select! {
+            () = wait_for_revocation(&mut control_grant) => {
+                tracing::debug!(dst = %guest_dst, "UDP flow revoked by host controller");
+                break;
+            }
             // Outbound: guest → server.
             data = outbound_rx.recv() => {
                 match data {

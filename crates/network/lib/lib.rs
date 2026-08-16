@@ -17,6 +17,7 @@ pub mod backend;
 pub mod builder;
 pub mod config;
 pub mod conn;
+pub mod control;
 pub mod device;
 pub mod dns;
 pub mod icmp_error;

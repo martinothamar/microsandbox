@@ -26,6 +26,7 @@ use super::common::config::NormalizedDnsConfig;
 use super::forwarder::{DnsForwarder, DnsForwarderHandle};
 use super::proxies::udp::UdpProxy;
 use crate::config::DnsConfig;
+use crate::control::NetworkControlClient;
 use crate::policy::NetworkPolicy;
 use crate::shared::SharedState;
 use crate::stack::GatewayIps;
@@ -101,6 +102,7 @@ impl DnsInterceptor {
         gateway: GatewayIps,
         gateway_mac: [u8; 6],
         guest_mac: [u8; 6],
+        controller: Option<NetworkControlClient>,
     ) -> (Self, DnsForwarderHandle) {
         // Create and bind the smoltcp UDP socket.
         let rx_meta = vec![PacketMetadata::EMPTY; DNS_SOCKET_PACKET_SLOTS];
@@ -141,6 +143,7 @@ impl DnsInterceptor {
             platform_policy,
             shared.clone(),
             gateway,
+            controller,
         );
         UdpProxy::spawn(
             tokio_handle,

@@ -2855,6 +2855,9 @@ fn sandbox_cli_args(
                 .expect("sandbox network spec should decode to local network config"),
         );
         launch.sandbox_slot = sandbox_id as u64;
+        if local.network_controlled(&config.spec.name) {
+            visible.push("--network-controlled".into());
+        }
     }
 
     for var in &config.spec.env {
@@ -3399,6 +3402,38 @@ mod tests {
                 OsString::from("--startup-fd"),
                 OsString::from(microsandbox_runtime::vm::STARTUP_FD.to_string()),
             ]));
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn controlled_networking_uses_a_fail_closed_cli_marker() {
+        let config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .build()
+            .await
+            .unwrap();
+        let local = test_local_backend();
+        local.set_network_controlled("test", true);
+
+        let (visible, _) = sandbox_cli_args(
+            &local,
+            &config,
+            42,
+            Path::new("/tmp/msb.db"),
+            30,
+            Path::new("/tmp/logs"),
+            Path::new("/tmp/runtime"),
+            Path::new("/tmp/agent.sock"),
+            Path::new("/tmp/libkrunfw.dylib"),
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(visible.contains(&OsString::from("--network-controlled")));
     }
 
     #[tokio::test]

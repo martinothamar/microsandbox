@@ -17,6 +17,9 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::conn::ProxyConnectState;
+use crate::control::{
+    NetworkControlClient, NetworkOperation, TransportProtocol, wait_for_revocation,
+};
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::secrets::config::{SecretsConfig, SecretsConfigExt, ViolationAction};
 use crate::secrets::handler::{
@@ -156,6 +159,7 @@ pub fn spawn_tcp_proxy(
     secrets: Arc<SecretsConfig>,
     tls_state: Option<Arc<TlsState>>,
     proxy_connect: Arc<ProxyConnectState>,
+    controller: Option<NetworkControlClient>,
 ) {
     handle.spawn(async move {
         if let Err(e) = tcp_proxy_task(
@@ -168,6 +172,7 @@ pub fn spawn_tcp_proxy(
             secrets,
             tls_state,
             proxy_connect,
+            controller,
         )
         .await
         {
@@ -189,6 +194,7 @@ async fn tcp_proxy_task(
     secrets: Arc<SecretsConfig>,
     tls_state: Option<Arc<TlsState>>,
     proxy_connect: Arc<ProxyConnectState>,
+    controller: Option<NetworkControlClient>,
 ) -> io::Result<()> {
     // Pre-connect peek is only for domain policy: the hostname has to be known
     // before we dial upstream so a Deny never opens a connection. Secrets do
@@ -233,6 +239,28 @@ async fn tcp_proxy_task(
         }
     }
 
+    let mut control_grant = if let Some(controller) = controller {
+        match controller
+            .authorize(NetworkOperation::Connect {
+                source: None,
+                destination: guest_dst,
+                transport: TransportProtocol::Tcp,
+                hostname: sni,
+            })
+            .await
+        {
+            Ok(grant) => Some(grant),
+            Err(error) => {
+                tracing::debug!(dst = %guest_dst, %error, "TCP egress denied by host controller");
+                proxy_connect.mark_policy_denied();
+                shared.proxy_wake.wake();
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
     // Peek for HTTP CONNECT before dialing upstream; hand off if detected.
     if let Some(tls_state) = tls_state.clone() {
         if initial_buf.is_empty() {
@@ -260,7 +288,14 @@ async fn tcp_proxy_task(
     // server-first protocol (SSH, SMTP, a database) sends nothing until it has
     // seen the server's banner; with the socket already open we can relay that
     // banner while we wait, instead of burning the peek budget pre-connect.
-    let stream = connect_upstream(connect_dst, &proxy_connect, &shared).await?;
+    let stream = tokio::select! {
+        result = connect_upstream(connect_dst, &proxy_connect, &shared) => result?,
+        () = wait_for_revocation(&mut control_grant) => {
+            proxy_connect.mark_policy_denied();
+            shared.proxy_wake.wake();
+            return Ok(());
+        }
+    };
     let (mut server_rx, mut server_tx) = stream.into_split();
 
     // Finish classifying the first flight (TLS vs plain HTTP) and, for
@@ -358,6 +393,10 @@ async fn tcp_proxy_task(
     let mut guest_eof = false;
     loop {
         tokio::select! {
+            () = wait_for_revocation(&mut control_grant) => {
+                tracing::debug!(dst = %guest_dst, "TCP flow revoked by host controller");
+                break;
+            }
             // Guest → server: substitute placeholders before forwarding.
             data = from_smoltcp.recv(), if !guest_eof => {
                 match data {
@@ -1664,6 +1703,7 @@ mod tests {
             secrets,
             None,
             proxy_connect,
+            None,
         )
         .await
         .unwrap();
@@ -1704,6 +1744,7 @@ mod tests {
             Arc::new(secrets),
             None,
             proxy_connect,
+            None,
         )
         .await
         .unwrap();
@@ -1774,6 +1815,7 @@ mod tests {
             Arc::new(secrets),
             None,
             proxy_connect,
+            None,
         )
         .await
         .unwrap();
@@ -1874,6 +1916,7 @@ mod tests {
             Arc::new(secrets),
             None,
             proxy_connect,
+            None,
         )
         .await
         .unwrap();

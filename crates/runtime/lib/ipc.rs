@@ -25,6 +25,9 @@ pub const CANONICAL_SOCKET_HASH_BYTES: usize = 12;
 /// Bytes of SHA-256 used by the legacy flat agent socket names.
 pub const LEGACY_SOCKET_HASH_BYTES: usize = 16;
 
+/// File name used by the canonical runtime-to-host Network control endpoint.
+pub const NETWORK_CONTROL_SOCKET_NAME: &str = "network-control.sock";
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -152,6 +155,37 @@ pub fn control_socket_path_for(agent_sock: &Path) -> PathBuf {
     }
 
     agent_sock.with_extension(crate::control::CONTROL_SOCKET_EXTENSION)
+}
+
+/// Derive the Network control endpoint belonging to an agent endpoint.
+pub fn network_control_endpoint_for(agent_sock: &Path) -> PathBuf {
+    #[cfg(unix)]
+    if is_canonical_agent_socket(agent_sock) {
+        let canonical_dir = agent_sock
+            .parent()
+            .expect("canonical agent endpoint has a parent");
+        let sandbox_key = canonical_dir
+            .file_name()
+            .expect("canonical agent endpoint has a sandbox key");
+        let run_dir = canonical_dir
+            .parent()
+            .and_then(Path::parent)
+            .expect("canonical agent endpoint is below the run directory");
+        return run_dir
+            .join("network-control")
+            .join(sandbox_key)
+            .with_extension("sock");
+    }
+
+    #[cfg(unix)]
+    {
+        agent_sock.with_extension(NETWORK_CONTROL_SOCKET_NAME)
+    }
+
+    #[cfg(windows)]
+    {
+        PathBuf::from(format!("{}-network-control", agent_sock.display()))
+    }
 }
 
 /// Derive every canonical and compatibility Unix socket path for a sandbox.
@@ -758,8 +792,16 @@ mod tests {
         );
         assert_eq!(control_socket_path_for(&paths.agent), paths.control);
         assert_eq!(
+            network_control_endpoint_for(&paths.agent),
+            Path::new("/tmp/msb/run/network-control/87eba76e7f3164534045ba92.sock")
+        );
+        assert_eq!(
             control_socket_path_for(Path::new("/tmp/msb/sandboxes/worker/runtime/agent.sock")),
             Path::new("/tmp/msb/sandboxes/worker/runtime/agent.control.sock")
+        );
+        assert_eq!(
+            network_control_endpoint_for(Path::new("/tmp/msb/sandboxes/worker/runtime/agent.sock")),
+            Path::new("/tmp/msb/sandboxes/worker/runtime/agent.network-control.sock")
         );
     }
 

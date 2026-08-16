@@ -43,6 +43,7 @@ use super::common::config::NormalizedDnsConfig;
 use super::common::filter::{is_private_ipv4, is_private_ipv6};
 use super::common::transport::Transport;
 use super::nameserver::{read_host_dns_servers, resolve_nameservers};
+use crate::control::{NetworkControlClient, NetworkOperation, TransportProtocol};
 use crate::policy::{Action, DomainName, NetworkPolicy};
 use crate::shared::{ResolvedHostnameFamily, SharedState};
 use crate::stack::GatewayIps;
@@ -109,6 +110,8 @@ pub(crate) struct DnsForwarder {
     /// `host.microsandbox.internal`.
     gateway: GatewayIps,
     config: Arc<NormalizedDnsConfig>,
+    /// Host authorization endpoint selected for controlled networking.
+    controller: Option<NetworkControlClient>,
 }
 
 /// One configured upstream and its per-transport clients.
@@ -216,6 +219,33 @@ impl DnsForwarder {
         {
             return Some(response);
         }
+
+        let _control_grant = if let Some(controller) = &self.controller {
+            let resolver = original_dst
+                .filter(|address| !self.gateway_ips.contains(address))
+                .map(|address| SocketAddr::new(address, transport.upstream_port()));
+            let transport = match transport {
+                Transport::Udp => TransportProtocol::Udp,
+                Transport::Tcp | Transport::Dot => TransportProtocol::Tcp,
+            };
+            match controller
+                .authorize(NetworkOperation::DnsQuery {
+                    name: domain.clone(),
+                    record_type: query_type.to_string(),
+                    resolver,
+                    transport,
+                })
+                .await
+            {
+                Ok(grant) => Some(grant),
+                Err(error) => {
+                    tracing::debug!(domain = %domain, %error, "DNS query denied by Network controller");
+                    return build_status_response(&query_msg, ResponseCode::NXDomain);
+                }
+            }
+        } else {
+            None
+        };
 
         // Pick upstream based on where the guest aimed and the network
         // policy, then forward. On the configured path, walk the
@@ -447,6 +477,7 @@ impl DnsForwarder {
         platform_policy: Option<Arc<NetworkPolicy>>,
         shared: Arc<SharedState>,
         gateway: GatewayIps,
+        controller: Option<NetworkControlClient>,
     ) -> DnsForwarderHandle {
         let (forwarder_tx, forwarder_rx) = watch::channel(None);
         handle.spawn(async move {
@@ -457,6 +488,7 @@ impl DnsForwarder {
                 platform_policy,
                 shared,
                 gateway,
+                controller,
             )
             .await
             else {
@@ -479,6 +511,7 @@ impl DnsForwarder {
         platform_policy: Option<Arc<NetworkPolicy>>,
         shared: Arc<SharedState>,
         gateway: GatewayIps,
+        controller: Option<NetworkControlClient>,
     ) -> Option<Arc<Self>> {
         let upstreams = if !config.nameservers.is_empty() {
             match resolve_nameservers(&config.nameservers).await {
@@ -534,6 +567,7 @@ impl DnsForwarder {
             shared,
             gateway,
             config,
+            controller,
         }))
     }
 
@@ -584,6 +618,7 @@ impl DnsForwarder {
             shared,
             gateway,
             config,
+            controller: None,
         })
     }
 }
@@ -960,6 +995,7 @@ mod tests {
                 ipv6: None,
             },
             config,
+            controller: None,
         })
     }
 

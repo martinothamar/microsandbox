@@ -18,6 +18,7 @@ use msb_krun::backends::net::NetBackend;
 
 use crate::backend::SmoltcpBackend;
 use crate::config::{MAX_NETWORK_CONNECTIONS, NetworkConfig};
+use crate::control::NetworkControlClient;
 use crate::policy::{NetworkPolicy, NetworkProfile};
 use crate::secrets::handle::SecretsHandle;
 use crate::shared::{DEFAULT_QUEUE_CAPACITY, SharedState};
@@ -73,6 +74,7 @@ pub struct SmoltcpNetwork {
 
     // Live-swappable secrets view shared with the poll loop and TLS state.
     secrets: SecretsHandle,
+    controller: Option<NetworkControlClient>,
 }
 
 /// Errors that prevent the smoltcp network from being created safely.
@@ -298,6 +300,7 @@ impl SmoltcpNetwork {
             gateway_ipv6,
             tls_state,
             secrets,
+            controller: None,
         })
     }
 
@@ -335,6 +338,7 @@ impl SmoltcpNetwork {
         let published_ports = self.config.ports.clone();
         let max_connections = self.config.max_connections;
         let secrets = self.secrets.clone();
+        let controller = self.controller.clone();
 
         self.poll_handle = Some(
             std::thread::Builder::new()
@@ -351,6 +355,7 @@ impl SmoltcpNetwork {
                         max_connections,
                         tokio_handle,
                         secrets,
+                        controller,
                     );
                 })
                 .expect("failed to spawn smoltcp poll thread"),
@@ -446,6 +451,11 @@ impl SmoltcpNetwork {
     /// updates without restarting the sandbox.
     pub fn secrets_handle(&self) -> SecretsHandle {
         self.secrets.clone()
+    }
+
+    /// Installs fail-closed host authorization before the network starts.
+    pub fn set_controller(&mut self, controller: NetworkControlClient) {
+        self.controller = Some(controller);
     }
 }
 
