@@ -4,7 +4,7 @@
 //! with real secret values, but only when the destination host is allowed.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 
@@ -13,7 +13,12 @@ use httlib_hpack::{Decoder as HpackDecoder, Encoder as HpackEncoder};
 use percent_encoding::percent_decode;
 
 use super::config::{
-    HostPattern, MAX_SECRET_PLACEHOLDER_BYTES, SecretEntry, SecretsConfig, ViolationAction,
+    HostPattern, MAX_SECRET_PLACEHOLDER_BYTES, SecretEntry, SecretSource, SecretsConfig,
+    ViolationAction,
+};
+use crate::control::{
+    HttpScheme as ControlHttpScheme, HttpVersion as ControlHttpVersion, NetworkControlClient,
+    NetworkOperation, SecretLocation, SecretMaterial,
 };
 use crate::shared::SharedState;
 
@@ -108,36 +113,8 @@ pub struct SecretsHandler {
     unsupported_body_tail: Vec<u8>,
     /// HTTP/2 parser/rewriter state once an HTTP/2 preface is observed.
     http2_state: Option<Http2State>,
-    /// Whether complete request headers must be reported before forwarding.
-    observe_http_requests: bool,
-    /// Complete requests discovered by the latest substitution calls.
-    observed_http_requests: Vec<ObservedHttpRequest>,
-}
-
-/// Trusted metadata for one complete HTTP request header block.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ObservedHttpRequest {
-    /// `http` for plaintext traffic and `https` for intercepted TLS.
-    pub scheme: HttpScheme,
-    /// Request authority without interpretation by the policy layer.
-    pub authority: String,
-    /// HTTP method.
-    pub method: String,
-    /// Request path with its query removed.
-    pub path: String,
-    /// Parsed protocol version.
-    pub version: HttpVersion,
-    /// HTTP/2 stream identifier, absent for HTTP/1.
-    pub stream_id: Option<u32>,
-}
-
-/// Scheme observed by the trusted HTTP parser.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HttpScheme {
-    /// Plaintext HTTP.
-    Http,
-    /// HTTP carried through intercepted TLS.
-    Https,
+    /// Host controller used for request authorization and deferred material.
+    controller: Option<NetworkControlClient>,
 }
 
 /// HTTP framing version observed by the trusted parser.
@@ -267,14 +244,19 @@ enum ChunkedBodyEvent<'a> {
 /// A secret that passed host matching for this connection.
 struct EligibleSecret {
     placeholder: String,
-    /// Resolved plaintext, wiped on drop so per-connection copies do not
-    /// linger in freed memory.
-    value: zeroize::Zeroizing<String>,
+    material: SecretMaterialSource,
     inject_headers: bool,
     inject_basic_auth: bool,
     inject_query_params: bool,
     inject_body: bool,
     require_tls_identity: bool,
+}
+
+enum SecretMaterialSource {
+    /// Resolved plaintext, wiped with the per-connection handler.
+    Static(zeroize::Zeroizing<String>),
+    /// Opaque store reference resolved by the host after authorization.
+    Deferred(String),
 }
 
 /// A secret that did not pass substitution or passthrough host matching.
@@ -304,6 +286,12 @@ struct RequestSummary {
     method: Option<String>,
     path: Option<String>,
     host: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum RequestHeaders<'a> {
+    Http1(&'a str),
+    Http2(&'a [(Vec<u8>, Vec<u8>)]),
 }
 
 /// Blocking action to take when an ineligible placeholder is detected.
@@ -346,6 +334,29 @@ enum PlaceholderMatchForm {
 //--------------------------------------------------------------------------------------------------
 
 impl EligibleSecret {
+    fn value<'a>(&'a self, material: &'a BTreeMap<String, SecretMaterial>) -> Option<&'a str> {
+        match &self.material {
+            SecretMaterialSource::Static(value) => Some(value.as_str()),
+            SecretMaterialSource::Deferred(reference) => {
+                material.get(reference).map(SecretMaterial::expose)
+            }
+        }
+    }
+
+    fn deferred_reference(&self) -> Option<&str> {
+        match &self.material {
+            SecretMaterialSource::Static(_) => None,
+            SecretMaterialSource::Deferred(reference) => Some(reference),
+        }
+    }
+
+    fn static_value(&self) -> Option<&str> {
+        match &self.material {
+            SecretMaterialSource::Static(value) => Some(value.as_str()),
+            SecretMaterialSource::Deferred(_) => None,
+        }
+    }
+
     /// Returns true if any of the header-side injection scopes is enabled
     /// (`headers`, `basic_auth`, or `query_params`).
     fn wants_header_injection(&self) -> bool {
@@ -377,14 +388,14 @@ impl EligibleSecret {
 
     /// Substitute this secret's placeholder in the headers portion, scoped by
     /// the secret's `headers` / `basic_auth` / `query_params` flags.
-    fn substitute_in_headers(&self, headers: &str) -> String {
+    fn substitute_in_headers(&self, headers: &str, value: &str) -> String {
         let mut result = String::with_capacity(headers.len());
         for (i, line) in headers.split("\r\n").enumerate() {
             if i > 0 {
                 result.push_str("\r\n");
             }
-            match self.substitute_in_header_line(line, i == 0) {
-                Some(s) => result.push_str(&s),
+            match self.substitute_in_header_line(line, i == 0, value) {
+                Some((line, _)) => result.push_str(&line),
                 None => result.push_str(line),
             }
         }
@@ -394,22 +405,31 @@ impl EligibleSecret {
     /// Substitute this secret's placeholder in a single header line. Returns
     /// `None` if the line is not in scope for any of the requested injection
     /// modes.
-    fn substitute_in_header_line(&self, line: &str, is_request_line: bool) -> Option<String> {
+    fn substitute_in_header_line(
+        &self,
+        line: &str,
+        is_request_line: bool,
+        value: &str,
+    ) -> Option<(String, SecretLocation)> {
         if is_request_line {
             return self
                 .inject_query_params
-                .then(|| substitute_query_in_request_line(line, &self.placeholder, &self.value))
-                .flatten();
+                .then(|| substitute_query_in_request_line(line, &self.placeholder, value))
+                .flatten()
+                .map(|line| (line, SecretLocation::Query));
         }
 
         if self.inject_basic_auth
             && is_authorization_header(line)
-            && let Some(replaced) = self.substitute_basic_auth_header(line)
+            && let Some(replaced) = self.substitute_basic_auth_header(line, value)
         {
-            return Some(replaced);
+            return Some((replaced, SecretLocation::BasicAuth));
         }
-        if self.inject_headers {
-            return Some(line.replace(&self.placeholder, &self.value));
+        if self.inject_headers && line.contains(&self.placeholder) {
+            return Some((
+                line.replace(&self.placeholder, value),
+                SecretLocation::Header,
+            ));
         }
         None
     }
@@ -419,17 +439,86 @@ impl EligibleSecret {
     /// if the line isn't `Basic` scheme or the decoded credentials don't
     /// contain the placeholder. Non-Basic schemes (e.g. `Bearer`) are handled
     /// by `inject_headers` instead.
-    fn substitute_basic_auth_header(&self, line: &str) -> Option<String> {
+    fn substitute_basic_auth_header(&self, line: &str, value: &str) -> Option<String> {
         let decoded = decode_basic_credentials(line)?;
         if !decoded.contains(&self.placeholder) {
             return None;
         }
         let (name, _) = line.split_once(':')?;
-        let replaced = decoded.replace(&self.placeholder, &self.value);
+        let replaced = decoded.replace(&self.placeholder, value);
         Some(format!(
             "{name}: Basic {}",
             BASE64.encode(replaced.as_bytes())
         ))
+    }
+
+    /// Detects the native injection scopes that would use this secret without
+    /// requiring its material. Passing the placeholder as the replacement is
+    /// an intentional dry run through the exact HTTP/1 substitution rules.
+    fn detect_http1_secret_locations(&self, headers: &str) -> BTreeSet<SecretLocation> {
+        let mut locations = BTreeSet::new();
+        for (index, line) in headers.split("\r\n").enumerate() {
+            if let Some((_, location)) =
+                self.substitute_in_header_line(line, index == 0, &self.placeholder)
+            {
+                locations.insert(location);
+            }
+        }
+        locations
+    }
+
+    /// Detects the native injection scopes that would use this secret without
+    /// requiring its material. Passing the placeholder as the replacement is
+    /// an intentional dry run through the exact HTTP/2 substitution rules.
+    fn detect_http2_secret_locations(
+        &self,
+        headers: &[(Vec<u8>, Vec<u8>)],
+    ) -> BTreeSet<SecretLocation> {
+        let mut locations = BTreeSet::new();
+        for (name, value) in headers {
+            if let Some((_, location)) =
+                self.substitute_http2_header(name, value, &self.placeholder)
+            {
+                locations.insert(location);
+            }
+        }
+        locations
+    }
+
+    fn substitute_http2_header(
+        &self,
+        name: &[u8],
+        value: &[u8],
+        secret_value: &str,
+    ) -> Option<(Vec<u8>, SecretLocation)> {
+        if name.eq_ignore_ascii_case(b":path")
+            && self.inject_query_params
+            && let Ok(path) = std::str::from_utf8(value)
+            && let Some(replaced) =
+                substitute_query_in_target(path, &self.placeholder, secret_value)
+        {
+            return Some((replaced.into_bytes(), SecretLocation::Query));
+        }
+        if name.eq_ignore_ascii_case(b"authorization")
+            && self.inject_basic_auth
+            && let Ok(header) = std::str::from_utf8(value)
+            && let Some(replaced) =
+                substitute_basic_auth_value(header, &self.placeholder, secret_value)
+        {
+            return Some((replaced.into_bytes(), SecretLocation::BasicAuth));
+        }
+        if !name.starts_with(b":")
+            && self.inject_headers
+            && contains_bytes(value, self.placeholder.as_bytes())
+        {
+            return Some((
+                String::from_utf8_lossy(value)
+                    .replace(&self.placeholder, secret_value)
+                    .into_bytes(),
+                SecretLocation::Header,
+            ));
+        }
+        None
     }
 }
 
@@ -628,7 +717,12 @@ impl SecretsHandler {
                 }
                 eligible_for_substitution.push(EligibleSecret {
                     placeholder: secret.placeholder.clone(),
-                    value: secret.value.clone(),
+                    material: match (&secret.source, secret.value.is_empty()) {
+                        (Some(SecretSource::Store { reference }), true) => {
+                            SecretMaterialSource::Deferred(reference.clone())
+                        }
+                        _ => SecretMaterialSource::Static(secret.value.clone()),
+                    },
                     inject_headers: secret.injection.headers,
                     inject_basic_auth: secret.injection.basic_auth,
                     inject_query_params: secret.injection.query_params,
@@ -682,8 +776,7 @@ impl SecretsHandler {
             http_pending: Vec::new(),
             unsupported_body_tail: Vec::new(),
             http2_state: None,
-            observe_http_requests: false,
-            observed_http_requests: Vec::new(),
+            controller: None,
         }
     }
 
@@ -693,16 +786,11 @@ impl SecretsHandler {
         self
     }
 
-    /// Enables trusted request-boundary observation for host authorization.
+    /// Attaches the host controller used before forwarding HTTP requests.
     #[must_use]
-    pub fn observe_http_requests(mut self) -> Self {
-        self.observe_http_requests = true;
+    pub(crate) fn with_controller(mut self, controller: NetworkControlClient) -> Self {
+        self.controller = Some(controller);
         self
-    }
-
-    /// Removes and returns requests discovered since the previous call.
-    pub fn take_observed_http_requests(&mut self) -> Vec<ObservedHttpRequest> {
-        std::mem::take(&mut self.observed_http_requests)
     }
 
     /// Substitute secrets in plaintext data (guest → server direction).
@@ -842,8 +930,6 @@ impl SecretsHandler {
             {
                 return Err(ViolationAction::Block);
             }
-            self.observe_request(&request_summary, HttpVersion::Http1, None)?;
-
             let transfer_encoding = parse_transfer_encoding(header_text.as_ref())?;
             if transfer_encoding.is_some() && parse_content_length(header_text.as_ref())?.is_some()
             {
@@ -851,11 +937,18 @@ impl SecretsHandler {
             }
 
             if transfer_encoding == Some(TransferEncoding::Chunked) {
+                let material = self.authorize_request(
+                    &request_summary,
+                    HttpVersion::Http1,
+                    None,
+                    RequestHeaders::Http1(header_text.as_ref()),
+                )?;
                 return self.substitute_chunked_ready(
                     data,
                     header_bytes,
                     after_headers,
                     header_text.as_ref(),
+                    &material,
                 );
             }
 
@@ -892,6 +985,17 @@ impl SecretsHandler {
 
         // Everything from `data` belonging to this request, headers and body.
         let this_request = &data[..header_bytes.len() + body_bytes.len()];
+        let material = if boundary.is_some() {
+            let headers = String::from_utf8_lossy(header_bytes);
+            self.authorize_request(
+                &http1_request_summary(headers.as_ref()),
+                HttpVersion::Http1,
+                None,
+                RequestHeaders::Http1(headers.as_ref()),
+            )?
+        } else {
+            BTreeMap::new()
+        };
 
         // Check for disallowed placeholders before forwarding or substituting data.
         self.apply_blocking_action(self.detect_blocking_action(
@@ -933,19 +1037,19 @@ impl SecretsHandler {
 
             // Header substitution still uses string helpers after a scoped match.
             if secret.may_substitute_in_headers(header_bytes) {
+                let value = secret.value(&material).ok_or(ViolationAction::Block)?;
                 let current = header_str
                     .get_or_insert_with(|| String::from_utf8_lossy(header_bytes).into_owned());
-                *current = secret.substitute_in_headers(current);
+                *current = secret.substitute_in_headers(current, value);
             }
 
             // Body substitution works on bytes so encoded payloads stay valid.
             if body_substitution_allowed && secret.inject_body {
                 let source = body.as_deref().unwrap_or(body_bytes);
-                if let Some(replaced) = replace_bytes(
-                    source,
-                    secret.placeholder.as_bytes(),
-                    secret.value.as_bytes(),
-                ) {
+                let value = secret.value(&material).ok_or(ViolationAction::Block)?;
+                if let Some(replaced) =
+                    replace_bytes(source, secret.placeholder.as_bytes(), value.as_bytes())
+                {
                     body = Some(replaced);
                 }
             }
@@ -1058,6 +1162,7 @@ impl SecretsHandler {
         header_bytes: &'a [u8],
         after_headers: &'a [u8],
         headers: &str,
+        material: &BTreeMap<String, SecretMaterial>,
     ) -> Result<Cow<'a, [u8]>, ViolationAction> {
         if self.needs_body_injection() && !has_non_identity_content_encoding(headers) {
             return self.substitute_chunked_rewrite_ready(
@@ -1065,6 +1170,7 @@ impl SecretsHandler {
                 header_bytes,
                 after_headers,
                 headers,
+                material,
             );
         }
 
@@ -1092,7 +1198,7 @@ impl SecretsHandler {
             HttpState::InChunkedBody { state }
         };
 
-        if let Some(headers) = self.substitute_header_bytes(header_bytes) {
+        if let Some(headers) = self.substitute_header_bytes(header_bytes, material)? {
             let mut output = Vec::with_capacity(headers.len() + body_part.len() + spillover.len());
             output.extend_from_slice(headers.as_bytes());
             output.extend_from_slice(body_part);
@@ -1113,6 +1219,7 @@ impl SecretsHandler {
         header_bytes: &'a [u8],
         after_headers: &'a [u8],
         headers: &str,
+        material: &BTreeMap<String, SecretMaterial>,
     ) -> Result<Cow<'a, [u8]>, ViolationAction> {
         let mut state = ChunkedRewriteState::default();
         let rewrite = self.rewrite_chunked_body_part(&mut state, after_headers)?;
@@ -1138,7 +1245,7 @@ impl SecretsHandler {
         };
 
         let header_len = header_bytes.len();
-        let header_out = self.substitute_header_bytes(header_bytes);
+        let header_out = self.substitute_header_bytes(header_bytes, material)?;
         let mut output = Vec::with_capacity(
             header_out
                 .as_ref()
@@ -1283,7 +1390,7 @@ impl SecretsHandler {
 
     /// Returns true if this connection needs no secret substitution or violation detection.
     pub fn is_empty(&self) -> bool {
-        !self.observe_http_requests
+        self.controller.is_none()
             && self.http_sni.is_none()
             && self.http_pending.is_empty()
             && self.unsupported_body_tail.is_empty()
@@ -1300,15 +1407,17 @@ impl SecretsHandler {
         })
     }
 
-    fn observe_request(
-        &mut self,
+    fn authorize_request(
+        &self,
         summary: &RequestSummary,
         version: HttpVersion,
         stream_id: Option<u32>,
-    ) -> Result<(), ViolationAction> {
-        if !self.observe_http_requests {
-            return Ok(());
-        }
+        headers: RequestHeaders<'_>,
+    ) -> Result<BTreeMap<String, SecretMaterial>, ViolationAction> {
+        let Some(controller) = &self.controller else {
+            return Ok(BTreeMap::new());
+        };
+        let destination = self.guest_dst.ok_or(ViolationAction::Block)?;
         let authority = summary
             .host
             .as_ref()
@@ -1318,19 +1427,63 @@ impl SecretsHandler {
             .ok_or(ViolationAction::Block)?;
         let method = summary.method.clone().ok_or(ViolationAction::Block)?;
         let path = summary.path.clone().ok_or(ViolationAction::Block)?;
-        self.observed_http_requests.push(ObservedHttpRequest {
-            scheme: if self.tls_intercepted {
-                HttpScheme::Https
-            } else {
-                HttpScheme::Http
-            },
-            authority,
-            method,
-            path,
-            version,
-            stream_id,
-        });
-        Ok(())
+        let scheme = if self.tls_intercepted {
+            ControlHttpScheme::Https
+        } else {
+            ControlHttpScheme::Http
+        };
+        let version = match version {
+            HttpVersion::Http1 => ControlHttpVersion::Http1,
+            HttpVersion::Http2 => ControlHttpVersion::Http2,
+        };
+        let grant = controller
+            .authorize_blocking(NetworkOperation::HttpRequest {
+                destination,
+                scheme,
+                authority: authority.clone(),
+                method: method.clone(),
+                path: path.clone(),
+                version,
+                stream_id,
+            })
+            .map_err(|_| ViolationAction::Block)?;
+        drop(grant);
+
+        let mut uses = BTreeMap::<String, BTreeSet<SecretLocation>>::new();
+        for secret in &self.eligible_for_substitution {
+            let Some(reference) = secret.deferred_reference() else {
+                continue;
+            };
+            let locations = match headers {
+                RequestHeaders::Http1(headers) => secret.detect_http1_secret_locations(headers),
+                RequestHeaders::Http2(headers) => secret.detect_http2_secret_locations(headers),
+            };
+            uses.entry(reference.to_string())
+                .or_default()
+                .extend(locations);
+        }
+
+        let mut material = BTreeMap::new();
+        for (secret, locations) in uses {
+            if locations.is_empty() {
+                continue;
+            }
+            let resolved = controller
+                .authorize_secret_use_blocking(NetworkOperation::SecretUse {
+                    destination,
+                    scheme,
+                    authority: authority.clone(),
+                    method: method.clone(),
+                    path: path.clone(),
+                    version,
+                    stream_id,
+                    secret: secret.clone(),
+                    locations: locations.into_iter().collect(),
+                })
+                .map_err(|_| ViolationAction::Block)?;
+            material.insert(secret, resolved);
+        }
+        Ok(material)
     }
 
     fn block_unsupported_body_placeholder(
@@ -1369,63 +1522,52 @@ impl SecretsHandler {
         })
     }
 
-    fn substitute_http2_headers(&self, headers: &mut [(Vec<u8>, Vec<u8>)]) {
+    fn substitute_http2_headers(
+        &self,
+        headers: &mut [(Vec<u8>, Vec<u8>)],
+        material: &BTreeMap<String, SecretMaterial>,
+    ) -> Result<(), ViolationAction> {
         for secret in &self.eligible_for_substitution {
             if secret.require_tls_identity && !self.tls_intercepted {
                 continue;
             }
 
+            // This second detection is also the fail-closed check for HTTP/2
+            // trailers, which do not perform another request authorization.
+            if secret.detect_http2_secret_locations(headers).is_empty() {
+                continue;
+            }
+            let secret_value = secret.value(material).ok_or(ViolationAction::Block)?;
             for (name, value) in headers.iter_mut() {
-                let is_pseudo = name.starts_with(b":");
-
-                if name.eq_ignore_ascii_case(b":path")
-                    && secret.inject_query_params
-                    && let Ok(path) = std::str::from_utf8(value)
-                    && let Some(replaced) =
-                        substitute_query_in_target(path, &secret.placeholder, &secret.value)
+                if let Some((replaced, _)) =
+                    secret.substitute_http2_header(name, value, secret_value)
                 {
-                    *value = replaced.into_bytes();
-                }
-
-                if !is_pseudo
-                    && name.eq_ignore_ascii_case(b"authorization")
-                    && secret.inject_basic_auth
-                    && let Ok(header_value) = std::str::from_utf8(value)
-                    && let Some(replaced) = substitute_basic_auth_value(
-                        header_value,
-                        &secret.placeholder,
-                        &secret.value,
-                    )
-                {
-                    *value = replaced.into_bytes();
-                }
-
-                if !is_pseudo
-                    && secret.inject_headers
-                    && contains_bytes(value, secret.placeholder.as_bytes())
-                {
-                    let replaced =
-                        String::from_utf8_lossy(value).replace(&secret.placeholder, &secret.value);
-                    *value = replaced.into_bytes();
+                    *value = replaced;
                 }
             }
         }
+        Ok(())
     }
 
-    fn substitute_header_bytes(&self, header_bytes: &[u8]) -> Option<String> {
+    fn substitute_header_bytes(
+        &self,
+        header_bytes: &[u8],
+        material: &BTreeMap<String, SecretMaterial>,
+    ) -> Result<Option<String>, ViolationAction> {
         let mut header_str: Option<String> = None;
         for secret in &self.eligible_for_substitution {
             if secret.require_tls_identity && !self.tls_intercepted {
                 continue;
             }
             if secret.may_substitute_in_headers(header_bytes) {
+                let value = secret.value(material).ok_or(ViolationAction::Block)?;
                 let current = header_str
                     .get_or_insert_with(|| String::from_utf8_lossy(header_bytes).into_owned());
-                *current = secret.substitute_in_headers(current);
+                *current = secret.substitute_in_headers(current, value);
             }
         }
 
-        header_str.filter(|headers| headers.as_bytes() != header_bytes)
+        Ok(header_str.filter(|headers| headers.as_bytes() != header_bytes))
     }
 
     fn consume_chunked_body_with_violation_detection(
@@ -1542,7 +1684,8 @@ impl SecretsHandler {
         let mut chunk_payload = Vec::with_capacity(safe_len);
         while cursor < safe_len {
             if let Some(secret) = self.matching_body_secret_at(&substitution_tail[cursor..]) {
-                chunk_payload.extend_from_slice(secret.value.as_bytes());
+                let value = secret.static_value().expect("body secrets are static");
+                chunk_payload.extend_from_slice(value.as_bytes());
                 cursor += secret.placeholder.len();
             } else {
                 chunk_payload.push(substitution_tail[cursor]);
@@ -1557,7 +1700,8 @@ impl SecretsHandler {
 
     fn matching_body_secret_at(&self, data: &[u8]) -> Option<&EligibleSecret> {
         self.eligible_for_substitution.iter().find(|secret| {
-            secret.inject_body
+            secret.static_value().is_some()
+                && secret.inject_body
                 && !secret.placeholder.is_empty()
                 && (!secret.require_tls_identity || self.tls_intercepted)
                 && data.starts_with(secret.placeholder.as_bytes())
@@ -1865,9 +2009,16 @@ impl Http2State {
         let detection_bytes = http2_header_detection_bytes(&headers);
         let detection_text = String::from_utf8_lossy(&detection_bytes);
         let request_summary = http2_request_summary(detection_text.as_ref());
-        if is_initial_request {
-            handler.observe_request(&request_summary, HttpVersion::Http2, Some(block.stream_id))?;
-        }
+        let material = if is_initial_request {
+            handler.authorize_request(
+                &request_summary,
+                HttpVersion::Http2,
+                Some(block.stream_id),
+                RequestHeaders::Http2(&headers),
+            )?
+        } else {
+            BTreeMap::new()
+        };
         handler.apply_blocking_action(detect_blocking_action_with_tail(
             &handler.ineligible_for_substitution,
             &[],
@@ -1878,7 +2029,7 @@ impl Http2State {
             Some(block.stream_id),
         ))?;
 
-        handler.substitute_http2_headers(&mut headers);
+        handler.substitute_http2_headers(&mut headers, &material)?;
         let encoded = self.encode_headers(&headers)?;
         append_http2_header_frames(output, block.stream_id, block.end_stream, &encoded)?;
         if block.end_stream {
@@ -3174,6 +3325,112 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deferred_secret_uses_native_header_substitution_after_authorization() {
+        use std::future::poll_fn;
+
+        use crate::control::{
+            AuthorizationDecision, ControllerMessage, NetworkControlHost, NetworkOperation,
+            RuntimeMessage,
+        };
+
+        let deferred = SecretEntry {
+            env_var: "PROVIDER_TOKEN".into(),
+            value: zeroize::Zeroizing::new(String::new()),
+            source: Some(SecretSource::Store {
+                reference: "provider-token".into(),
+            }),
+            placeholder: "$TOKEN".into(),
+            allowed_hosts: vec![HostPattern::Any],
+            injection: SecretInjection::default(),
+            on_violation: Some(ViolationAction::Block),
+            require_tls_identity: true,
+        };
+        let config = make_config(vec![deferred]);
+        let directory = std::env::temp_dir().join(format!(
+            "microsandbox-network-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let endpoint = directory.join("network.sock");
+        let host = NetworkControlHost::bind(endpoint.clone()).await.unwrap();
+        let mut host = host.into_parts();
+        let controller = tokio::spawn({
+            let config = config.clone();
+            async move {
+                let mut authorizations = 0;
+                let mut closed_flows = 0;
+                while authorizations < 2 || closed_flows < 2 {
+                    let bytes = poll_fn(|context| host.incoming.poll_recv(context))
+                        .await
+                        .expect("runtime control message");
+                    let message: RuntimeMessage = serde_json::from_slice(&bytes).unwrap();
+                    let response = match message {
+                        RuntimeMessage::Hello { protocol } => ControllerMessage::HelloAccepted {
+                            protocol,
+                            secrets: config.clone(),
+                        },
+                        RuntimeMessage::AuthorizationRequest {
+                            request_id,
+                            operation,
+                            ..
+                        } => {
+                            authorizations += 1;
+                            let secret_material = match operation {
+                                NetworkOperation::HttpRequest { .. } => None,
+                                NetworkOperation::SecretUse {
+                                    secret, locations, ..
+                                } => {
+                                    assert_eq!(secret, "provider-token");
+                                    assert_eq!(locations, vec![SecretLocation::Header]);
+                                    Some(SecretMaterial::new("resolved-token".into()))
+                                }
+                                operation => panic!("unexpected operation: {operation:?}"),
+                            };
+                            ControllerMessage::AuthorizationDecision {
+                                request_id,
+                                decision: AuthorizationDecision::Allow,
+                                secret_material,
+                            }
+                        }
+                        RuntimeMessage::FlowClosed { .. } => {
+                            closed_flows += 1;
+                            continue;
+                        }
+                    };
+                    host.outgoing
+                        .send(zeroize::Zeroizing::new(
+                            serde_json::to_vec(&response).unwrap(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+
+        let client = NetworkControlClient::new(endpoint, &tokio::runtime::Handle::current());
+        let config = client.secrets_config().await.unwrap();
+        let mut handler =
+            SecretsHandler::new_tls_intercepted_via_connect(&config, "api.example.com")
+                .with_guest_dst("198.51.100.10:443".parse().unwrap())
+                .with_controller(client);
+        let request = b"GET / HTTP/1.1\r\nHost: api.example.com\r\nX-Token: $TOKEN\r\n\r\n";
+
+        let output = handler.substitute(request).unwrap();
+
+        assert_eq!(
+            output.as_ref(),
+            b"GET / HTTP/1.1\r\nHost: api.example.com\r\nX-Token: resolved-token\r\n\r\n"
+        );
+        controller.await.unwrap();
+        drop(handler);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     fn cache_host(shared: &SharedState, host: &str, ip: Ipv4Addr) {
         shared.cache_resolved_hostname(
             host,
@@ -3337,76 +3594,6 @@ mod tests {
             .map(|(_, value)| value.as_slice())
             .expect("header present");
         String::from_utf8(value.to_vec()).unwrap()
-    }
-
-    #[test]
-    fn observes_pipelined_http1_requests_without_secrets() {
-        let config = make_config(Vec::new());
-        let shared = SharedState::new(16);
-        let mut handler = SecretsHandler::new_plain_http(
-            &config,
-            "example.com",
-            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
-            &shared,
-        )
-        .observe_http_requests();
-        let input = b"GET /one?credential=hidden HTTP/1.1\r\nHost: example.com\r\n\r\nPOST /two HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n";
-
-        assert_eq!(handler.substitute(input).unwrap().as_ref(), input);
-        assert_eq!(
-            handler.take_observed_http_requests(),
-            vec![
-                ObservedHttpRequest {
-                    scheme: HttpScheme::Http,
-                    authority: "example.com".to_string(),
-                    method: "GET".to_string(),
-                    path: "/one".to_string(),
-                    version: HttpVersion::Http1,
-                    stream_id: None,
-                },
-                ObservedHttpRequest {
-                    scheme: HttpScheme::Http,
-                    authority: "example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/two".to_string(),
-                    version: HttpVersion::Http1,
-                    stream_id: None,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn observes_intercepted_http2_request_without_secrets() {
-        let config = make_config(Vec::new());
-        let mut handler =
-            SecretsHandler::new_tls_intercepted_via_connect(&config, "api.example.com")
-                .observe_http_requests();
-        let request = h2_request(
-            &[
-                (b":method", b"GET"),
-                (b":scheme", b"https"),
-                (b":authority", b"api.example.com"),
-                (b":path", b"/v1/items?credential=hidden"),
-            ],
-            true,
-        );
-
-        assert_eq!(
-            handler.substitute(&request).unwrap().as_ref(),
-            request.as_slice()
-        );
-        assert_eq!(
-            handler.take_observed_http_requests(),
-            vec![ObservedHttpRequest {
-                scheme: HttpScheme::Https,
-                authority: "api.example.com".to_string(),
-                method: "GET".to_string(),
-                path: "/v1/items".to_string(),
-                version: HttpVersion::Http2,
-                stream_id: Some(1),
-            }]
-        );
     }
 
     #[test]

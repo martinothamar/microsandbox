@@ -24,8 +24,7 @@ use crate::control::{
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::secrets::config::{SecretsConfig, SecretsConfigExt, ViolationAction};
 use crate::secrets::handler::{
-    HttpScheme, HttpVersion, SecretsHandler, first_line_is_not_http_request,
-    looks_like_http_request_prefix,
+    SecretsHandler, first_line_is_not_http_request, looks_like_http_request_prefix,
 };
 use crate::shared::SharedState;
 use crate::tls::proxy::{TlsProxyContext, tls_proxy_task};
@@ -270,6 +269,7 @@ async fn tcp_proxy_task(
     } else {
         None
     };
+    let secrets = load_controlled_secrets(secrets, controller.as_ref()).await?;
 
     // Peek for HTTP CONNECT before dialing upstream; hand off if detected.
     if let Some(tls_state) = tls_state.clone() {
@@ -367,10 +367,10 @@ async fn tcp_proxy_task(
             Some(host) => SecretsHandler::new_plain_http(&secrets, &host, guest_dst.ip(), &shared),
             None => SecretsHandler::new_plain_http_invalid_host(&secrets),
         };
-        Some(if controller.is_some() {
-            handler.observe_http_requests()
-        } else {
-            handler
+        let handler = handler.with_guest_dst(guest_dst);
+        Some(match &controller {
+            Some(controller) => handler.with_controller(controller.clone()),
+            None => handler,
         })
     } else {
         None
@@ -393,9 +393,6 @@ async fn tcp_proxy_task(
             },
             None => Cow::Borrowed(&initial_buf),
         };
-        if let Some(handler) = secrets_handler.as_mut() {
-            authorize_http_requests(controller.as_ref(), guest_dst, handler).await?;
-        }
         if !out.is_empty() {
             if let Err(e) = server_tx.write_all(&out).await {
                 tracing::debug!(dst = %connect_dst, error = %e, "replay of buffered first flight failed");
@@ -466,16 +463,6 @@ async fn tcp_proxy_task(
                             },
                             None => Cow::Borrowed(&bytes),
                         };
-                        if let Some(handler) = secrets_handler.as_mut()
-                            && let Err(error) = authorize_http_requests(
-                                controller.as_ref(),
-                                guest_dst,
-                                handler,
-                            ).await
-                        {
-                            tracing::debug!(dst = %guest_dst, %error, "HTTP request denied by Network controller");
-                            break;
-                        }
                         if !out.is_empty() {
                             if let Err(e) = server_tx.write_all(&out).await {
                                 tracing::debug!(dst = %connect_dst, error = %e, "write to server failed");
@@ -529,43 +516,26 @@ async fn tcp_proxy_task(
     Ok(())
 }
 
-/// Authorizes complete requests reported by the trusted HTTP parser.
-///
-/// Request grants are point-in-time permissions: dropping a grant after the
-/// headers are accepted closes its host-side bookkeeping, while the enclosing
-/// transport grant continues to support live flow revocation.
-pub(crate) async fn authorize_http_requests(
+pub(crate) async fn load_controlled_secrets(
+    secrets: Arc<SecretsConfig>,
     controller: Option<&NetworkControlClient>,
-    destination: SocketAddr,
-    handler: &mut SecretsHandler,
-) -> io::Result<()> {
-    let requests = handler.take_observed_http_requests();
+) -> io::Result<Arc<SecretsConfig>> {
     let Some(controller) = controller else {
-        debug_assert!(requests.is_empty());
-        return Ok(());
+        return Ok(secrets);
     };
-    for request in requests {
-        let grant = controller
-            .authorize(NetworkOperation::HttpRequest {
-                destination,
-                scheme: match request.scheme {
-                    HttpScheme::Http => ControlHttpScheme::Http,
-                    HttpScheme::Https => ControlHttpScheme::Https,
-                },
-                authority: request.authority,
-                method: request.method,
-                path: request.path,
-                version: match request.version {
-                    HttpVersion::Http1 => ControlHttpVersion::Http1,
-                    HttpVersion::Http2 => ControlHttpVersion::Http2,
-                },
-                stream_id: request.stream_id,
-            })
-            .await
-            .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
-        drop(grant);
+    let controlled = controller
+        .secrets_config()
+        .await
+        .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
+    if controlled.secrets.is_empty() {
+        return Ok(secrets);
     }
-    Ok(())
+    let mut merged = secrets.as_ref().clone();
+    merged.secrets.extend(controlled.secrets.iter().cloned());
+    merged
+        .validate()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(Arc::new(merged))
 }
 
 /// Forward an HTTP CONNECT tunnel: dial the proxy, splice the handshake,

@@ -22,7 +22,7 @@ use crate::control::{
     NetworkControlClient, NetworkGrant, NetworkOperation, TransportProtocol, wait_for_revocation,
 };
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
-use crate::proxy::connect_upstream;
+use crate::proxy::{connect_upstream, load_controlled_secrets};
 use crate::secrets::config::ViolationAction;
 use crate::secrets::handler::SecretsHandler;
 use crate::shared::SharedState;
@@ -301,15 +301,15 @@ pub(crate) async fn intercept_relay(
     mut control_grant: Option<NetworkGrant>,
 ) -> io::Result<()> {
     // Per-connection snapshot: live secret updates apply to later connections.
-    let secrets = tls_state.secrets.load();
+    let secrets = load_controlled_secrets(tls_state.secrets.load(), controller.as_ref()).await?;
     let mut secrets_handler = if via_connect {
         SecretsHandler::new_tls_intercepted_via_connect(&secrets, sni_name)
     } else {
         SecretsHandler::new_tls_intercepted(&secrets, sni_name, guest_dst.ip(), &shared)
     }
     .with_guest_dst(guest_dst);
-    if controller.is_some() {
-        secrets_handler = secrets_handler.observe_http_requests();
+    if let Some(controller) = &controller {
+        secrets_handler = secrets_handler.with_controller(controller.clone());
     }
 
     // Get or generate per-domain certificate (includes cached ServerConfig).
@@ -384,8 +384,6 @@ pub(crate) async fn intercept_relay(
         &mut guest_tls,
         &mut server_tls,
         &mut secrets_handler,
-        controller.as_ref(),
-        guest_dst,
         &shared,
         &mut plaintext_buf,
     )
@@ -428,8 +426,6 @@ pub(crate) async fn intercept_relay(
                         &mut guest_tls,
                         &mut server_tls,
                         &mut secrets_handler,
-                        controller.as_ref(),
-                        guest_dst,
                         &shared,
                         &mut plaintext_buf,
                     )
@@ -503,8 +499,6 @@ async fn forward_plaintext(
     guest_tls: &mut rustls::ServerConnection,
     server_tls: &mut tokio_rustls::client::TlsStream<TcpStream>,
     secrets_handler: &mut SecretsHandler,
-    controller: Option<&NetworkControlClient>,
-    guest_dst: SocketAddr,
     shared: &SharedState,
     buf: &mut [u8],
 ) -> io::Result<()> {
@@ -526,8 +520,6 @@ async fn forward_plaintext(
 
         match secrets_handler.substitute(&buf[..n]) {
             Ok(data) => {
-                crate::proxy::authorize_http_requests(controller, guest_dst, secrets_handler)
-                    .await?;
                 if !data.is_empty() {
                     server_tls.write_all(&data).await?;
                     wrote_plaintext = true;

@@ -6,6 +6,7 @@
 //! transport carries bounded, length-delimited JSON messages.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -13,17 +14,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{mpsc, oneshot, watch};
+use zeroize::Zeroizing;
+
+use crate::secrets::config::{SecretSource, SecretsConfig};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
 //--------------------------------------------------------------------------------------------------
 
 /// Stable protocol selected by compatible Sandbox and Network Backends.
-pub const NETWORK_CONTROL_PROTOCOL: &str = "microsandbox.network-control.v2";
+pub const NETWORK_CONTROL_PROTOCOL: &str = "microsandbox.network-control.v3";
 
 /// Maximum serialized control message accepted from either peer.
 pub const MAX_CONTROL_MESSAGE_LENGTH: usize = 64 * 1024;
@@ -69,6 +72,43 @@ pub enum HttpVersion {
     Http1,
     /// HTTP/2 framing.
     Http2,
+}
+
+/// Native secret-injection location observed by the trusted HTTP engine.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SecretLocation {
+    /// A regular HTTP header value.
+    Header,
+    /// HTTP Basic authentication credentials after decoding.
+    BasicAuth,
+    /// The query component of the request target.
+    Query,
+}
+
+/// Secret material returned for one authorized use.
+#[derive(Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct SecretMaterial(Zeroizing<String>);
+
+impl SecretMaterial {
+    /// Takes ownership of resolved secret material.
+    #[must_use]
+    pub fn new(value: String) -> Self {
+        Self(Zeroizing::new(value))
+    }
+
+    /// Borrows the material for immediate substitution.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Debug for SecretMaterial {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecretMaterial([REDACTED])")
+    }
 }
 
 /// Trusted outbound operation described by the Microsandbox network engine.
@@ -117,6 +157,28 @@ pub enum NetworkOperation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stream_id: Option<u32>,
     },
+    /// Authorize one native secret-engine substitution for an HTTP request.
+    SecretUse {
+        /// Original transport destination requested by the Sandbox.
+        destination: SocketAddr,
+        /// Plaintext or intercepted-TLS scheme.
+        scheme: HttpScheme,
+        /// Request authority reported by trusted protocol parsing.
+        authority: String,
+        /// HTTP method.
+        method: String,
+        /// Request path with its query removed.
+        path: String,
+        /// HTTP framing version.
+        version: HttpVersion,
+        /// HTTP/2 stream identifier, absent for HTTP/1.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_id: Option<u32>,
+        /// Opaque host-owned identifier from the entry's `store` source.
+        secret: String,
+        /// Native injection scopes in which this request uses the secret.
+        locations: Vec<SecretLocation>,
+    },
 }
 
 /// Message emitted by the trusted Microsandbox runtime.
@@ -155,13 +217,16 @@ pub enum AuthorizationDecision {
 }
 
 /// Message returned by the host-side Network Backend.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ControllerMessage {
     /// Accept the requested protocol version.
     HelloAccepted {
         /// Accepted protocol identity.
         protocol: String,
+        /// Deferred entries consumed by the existing Microsandbox secret engine.
+        #[serde(default)]
+        secrets: SecretsConfig,
     },
     /// Complete one authorization request.
     AuthorizationDecision {
@@ -169,6 +234,9 @@ pub enum ControllerMessage {
         request_id: u64,
         /// Authorization result.
         decision: AuthorizationDecision,
+        /// Resolved material, present only for an allowed `secretUse` operation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret_material: Option<SecretMaterial>,
     },
     /// Revoke a previously allowed live flow.
     Revoke {
@@ -186,14 +254,16 @@ pub struct NetworkControlClient {
 struct ClientInner {
     commands: mpsc::Sender<Command>,
     next_id: AtomicU64,
+    secrets: watch::Receiver<Option<Arc<SecretsConfig>>>,
 }
 
 enum Command {
+    Connect,
     Authorize {
         request_id: u64,
         flow_id: u64,
         operation: NetworkOperation,
-        response: oneshot::Sender<AuthorizationDecision>,
+        response: oneshot::Sender<AuthorizationResponse>,
         revoked: watch::Sender<bool>,
     },
     Cancel {
@@ -214,8 +284,13 @@ pub struct NetworkGrant {
 
 struct PendingAuthorization {
     flow_id: u64,
-    response: oneshot::Sender<AuthorizationDecision>,
+    response: oneshot::Sender<AuthorizationResponse>,
     revoked: watch::Sender<bool>,
+}
+
+struct AuthorizationResponse {
+    decision: AuthorizationDecision,
+    secret_material: Option<SecretMaterial>,
 }
 
 /// Failure to obtain a positive host authorization result.
@@ -230,6 +305,9 @@ pub enum AuthorizationError {
     /// The controller explicitly denied the operation.
     #[error("Network controller denied the operation")]
     Denied,
+    /// The controller returned material inconsistent with the operation.
+    #[error("Network controller returned an invalid authorization response")]
+    InvalidResponse,
 }
 
 #[cfg(unix)]
@@ -250,7 +328,7 @@ struct Connection {
 /// without handling Unix sockets or Windows named pipes themselves.
 pub struct NetworkControlHost {
     incoming: NetworkControlIncoming,
-    outgoing: mpsc::Sender<Bytes>,
+    outgoing: mpsc::Sender<Zeroizing<Vec<u8>>>,
 }
 
 /// Bounded host-side channels for a controlled Sandbox runtime.
@@ -258,14 +336,14 @@ pub struct NetworkControlHostParts {
     /// Complete protocol messages emitted by the trusted runtime.
     pub incoming: NetworkControlIncoming,
     /// Complete protocol messages sent back to the trusted runtime.
-    pub outgoing: mpsc::Sender<Bytes>,
+    pub outgoing: mpsc::Sender<Zeroizing<Vec<u8>>>,
 }
 
 /// Receiver for complete runtime protocol messages.
 ///
 /// Dropping this value closes the endpoint and removes its Unix socket.
 pub struct NetworkControlIncoming {
-    receiver: mpsc::Receiver<Bytes>,
+    receiver: mpsc::Receiver<Zeroizing<Vec<u8>>>,
     shutdown: Option<oneshot::Sender<()>>,
 }
 
@@ -290,13 +368,46 @@ impl NetworkControlClient {
     #[must_use]
     pub fn new(endpoint: PathBuf, runtime: &tokio::runtime::Handle) -> Self {
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
-        runtime.spawn(run_client(endpoint, receiver));
+        let (secrets_tx, secrets) = watch::channel(None);
+        runtime.spawn(run_client(endpoint, receiver, secrets_tx));
+        let _ = commands.try_send(Command::Connect);
         Self {
             inner: Arc::new(ClientInner {
                 commands,
                 next_id: AtomicU64::new(1),
+                secrets,
             }),
         }
+    }
+
+    /// Waits for the native secret configuration supplied by the controller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a compatible controller cannot be reached before
+    /// the fail-closed deadline.
+    pub async fn secrets_config(&self) -> Result<Arc<SecretsConfig>, AuthorizationError> {
+        let mut secrets = self.inner.secrets.clone();
+        if let Some(config) = secrets.borrow().clone() {
+            return Ok(config);
+        }
+        self.inner
+            .commands
+            .try_send(Command::Connect)
+            .map_err(|_| AuthorizationError::Unavailable)?;
+        tokio::time::timeout(AUTHORIZATION_TIMEOUT, async move {
+            loop {
+                secrets
+                    .changed()
+                    .await
+                    .map_err(|_| AuthorizationError::Unavailable)?;
+                if let Some(config) = secrets.borrow().clone() {
+                    return Ok(config);
+                }
+            }
+        })
+        .await
+        .map_err(|_| AuthorizationError::Timeout)?
     }
 
     /// Requests permission and returns a revocable flow grant.
@@ -309,6 +420,78 @@ impl NetworkControlClient {
         &self,
         operation: NetworkOperation,
     ) -> Result<NetworkGrant, AuthorizationError> {
+        let (grant, secret_material) = self.request_authorization(operation).await?;
+        if secret_material.is_some() {
+            return Err(AuthorizationError::InvalidResponse);
+        }
+        Ok(grant)
+    }
+
+    /// Authorizes one native secret use and returns its request-scoped material.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the operation is not `secretUse`, authorization
+    /// fails, or the controller omits the required material.
+    pub async fn authorize_secret_use(
+        &self,
+        operation: NetworkOperation,
+    ) -> Result<SecretMaterial, AuthorizationError> {
+        if !matches!(operation, NetworkOperation::SecretUse { .. }) {
+            return Err(AuthorizationError::InvalidResponse);
+        }
+        let (grant, material) = self.request_authorization(operation).await?;
+        drop(grant);
+        material.ok_or(AuthorizationError::InvalidResponse)
+    }
+
+    /// Synchronously authorizes an operation from the native HTTP parser.
+    ///
+    /// The parser is synchronous. Controlled network handlers run on the
+    /// Microsandbox multi-thread Tokio runtime, so `block_in_place` yields the
+    /// worker while the independent controller task performs local IPC.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on denial, invalid response, timeout, transport
+    /// failure, or use from a runtime that cannot yield a blocking section.
+    pub(crate) fn authorize_blocking(
+        &self,
+        operation: NetworkOperation,
+    ) -> Result<NetworkGrant, AuthorizationError> {
+        let handle =
+            tokio::runtime::Handle::try_current().map_err(|_| AuthorizationError::Unavailable)?;
+        if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+            return Err(AuthorizationError::Unavailable);
+        }
+        tokio::task::block_in_place(|| handle.block_on(self.authorize(operation)))
+    }
+
+    /// Authorizes one native secret use and returns only its request-scoped material.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the operation is not `secretUse`, authorization
+    /// fails, or the controller omits the required material.
+    pub(crate) fn authorize_secret_use_blocking(
+        &self,
+        operation: NetworkOperation,
+    ) -> Result<SecretMaterial, AuthorizationError> {
+        if !matches!(operation, NetworkOperation::SecretUse { .. }) {
+            return Err(AuthorizationError::InvalidResponse);
+        }
+        let handle =
+            tokio::runtime::Handle::try_current().map_err(|_| AuthorizationError::Unavailable)?;
+        if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+            return Err(AuthorizationError::Unavailable);
+        }
+        tokio::task::block_in_place(|| handle.block_on(self.authorize_secret_use(operation)))
+    }
+
+    async fn request_authorization(
+        &self,
+        operation: NetworkOperation,
+    ) -> Result<(NetworkGrant, Option<SecretMaterial>), AuthorizationError> {
         let request_id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let flow_id = request_id;
         let (response_tx, response_rx) = oneshot::channel();
@@ -325,12 +508,21 @@ impl NetworkControlClient {
             .map_err(|_| AuthorizationError::Unavailable)?;
 
         match tokio::time::timeout(AUTHORIZATION_TIMEOUT, response_rx).await {
-            Ok(Ok(AuthorizationDecision::Allow)) => Ok(NetworkGrant {
-                flow_id,
-                revoked: revoked_rx,
-                commands: self.inner.commands.clone(),
-            }),
-            Ok(Ok(AuthorizationDecision::Deny)) => Err(AuthorizationError::Denied),
+            Ok(Ok(AuthorizationResponse {
+                decision: AuthorizationDecision::Allow,
+                secret_material,
+            })) => Ok((
+                NetworkGrant {
+                    flow_id,
+                    revoked: revoked_rx,
+                    commands: self.inner.commands.clone(),
+                },
+                secret_material,
+            )),
+            Ok(Ok(AuthorizationResponse {
+                decision: AuthorizationDecision::Deny,
+                ..
+            })) => Err(AuthorizationError::Denied),
             Ok(Err(_)) => Err(AuthorizationError::Unavailable),
             Err(_) => {
                 let _ = self.inner.commands.try_send(Command::Cancel {
@@ -386,7 +578,7 @@ impl NetworkControlIncoming {
     pub fn poll_recv(
         &mut self,
         context: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Bytes>> {
+    ) -> std::task::Poll<Option<Zeroizing<Vec<u8>>>> {
         self.receiver.poll_recv(context)
     }
 }
@@ -489,8 +681,8 @@ async fn accept_host_connection(
 async fn run_host_listener(
     mut listener: HostListener,
     endpoint: PathBuf,
-    incoming: mpsc::Sender<Bytes>,
-    mut outgoing: mpsc::Receiver<Bytes>,
+    incoming: mpsc::Sender<Zeroizing<Vec<u8>>>,
+    mut outgoing: mpsc::Receiver<Zeroizing<Vec<u8>>>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let _cleanup = HostEndpointCleanup(endpoint.clone());
@@ -516,8 +708,8 @@ async fn run_host_listener(
 
 async fn run_host_connection(
     connection: HostConnection,
-    incoming: &mpsc::Sender<Bytes>,
-    outgoing: &mut mpsc::Receiver<Bytes>,
+    incoming: &mpsc::Sender<Zeroizing<Vec<u8>>>,
+    outgoing: &mut mpsc::Receiver<Zeroizing<Vec<u8>>>,
     shutdown: &mut oneshot::Receiver<()>,
 ) -> io::Result<()> {
     let (mut reader, mut writer) = tokio::io::split(connection);
@@ -539,7 +731,7 @@ async fn run_host_connection(
     }
 }
 
-async fn read_frame<R>(reader: &mut R) -> io::Result<Option<Bytes>>
+async fn read_frame<R>(reader: &mut R) -> io::Result<Option<Zeroizing<Vec<u8>>>>
 where
     R: AsyncRead + Unpin,
 {
@@ -554,9 +746,9 @@ where
             "Network control message is too large",
         ));
     }
-    let mut payload = vec![0; length];
+    let mut payload = Zeroizing::new(vec![0; length]);
     reader.read_exact(&mut payload).await?;
-    Ok(Some(Bytes::from(payload)))
+    Ok(Some(payload))
 }
 
 async fn write_frame<W>(writer: &mut W, payload: &[u8]) -> io::Result<()>
@@ -591,7 +783,11 @@ impl Drop for HostEndpointCleanup {
     fn drop(&mut self) {}
 }
 
-async fn run_client(endpoint: PathBuf, mut commands: mpsc::Receiver<Command>) {
+async fn run_client(
+    endpoint: PathBuf,
+    mut commands: mpsc::Receiver<Command>,
+    secrets: watch::Sender<Option<Arc<SecretsConfig>>>,
+) {
     let mut connection: Option<Connection> = None;
     let mut pending = HashMap::<u64, PendingAuthorization>::new();
     let mut flows = HashMap::<u64, watch::Sender<bool>>::new();
@@ -604,7 +800,10 @@ async fn run_client(endpoint: PathBuf, mut commands: mpsc::Receiver<Command>) {
             let connected =
                 tokio::time::timeout(CONNECT_TIMEOUT, connect_and_handshake(&endpoint)).await;
             match connected {
-                Ok(Ok(connected)) => connection = Some(connected),
+                Ok(Ok((connected, config))) => {
+                    let _ = secrets.send(Some(Arc::new(config)));
+                    connection = Some(connected);
+                }
                 Ok(Err(error)) => {
                     tracing::debug!(endpoint = %endpoint.display(), %error, "Network controller connection failed");
                     deny_command(command);
@@ -625,7 +824,7 @@ async fn run_client(endpoint: PathBuf, mut commands: mpsc::Receiver<Command>) {
             .await
             .is_err()
             {
-                disconnect(&mut connection, &mut pending, &mut flows);
+                disconnect(&mut connection, &mut pending, &mut flows, &secrets);
             }
             continue;
         }
@@ -637,19 +836,19 @@ async fn run_client(endpoint: PathBuf, mut commands: mpsc::Receiver<Command>) {
                     break;
                 };
                 if handle_command(command, Some(&mut active.writer), &mut pending, &mut flows).await.is_err() {
-                    disconnect(&mut connection, &mut pending, &mut flows);
+                    disconnect(&mut connection, &mut pending, &mut flows, &secrets);
                 }
             }
             message = read_message::<_, ControllerMessage>(&mut active.reader) => {
                 match message {
                     Ok(Some(message)) => handle_controller_message(message, &mut pending, &mut flows),
-                    Ok(None) | Err(_) => disconnect(&mut connection, &mut pending, &mut flows),
+                    Ok(None) | Err(_) => disconnect(&mut connection, &mut pending, &mut flows, &secrets),
                 }
             }
         }
     }
 
-    disconnect(&mut connection, &mut pending, &mut flows);
+    disconnect(&mut connection, &mut pending, &mut flows, &secrets);
 }
 
 async fn handle_command(
@@ -659,6 +858,7 @@ async fn handle_command(
     flows: &mut HashMap<u64, watch::Sender<bool>>,
 ) -> io::Result<()> {
     match command {
+        Command::Connect => {}
         Command::Authorize {
             request_id,
             flow_id,
@@ -667,7 +867,10 @@ async fn handle_command(
             revoked,
         } => {
             let Some(writer) = writer else {
-                let _ = response.send(AuthorizationDecision::Deny);
+                let _ = response.send(AuthorizationResponse {
+                    decision: AuthorizationDecision::Deny,
+                    secret_material: None,
+                });
                 return Ok(());
             };
             write_message(
@@ -717,6 +920,7 @@ fn handle_controller_message(
         ControllerMessage::AuthorizationDecision {
             request_id,
             decision,
+            secret_material,
         } => {
             let Some(pending) = pending.remove(&request_id) else {
                 return;
@@ -724,7 +928,10 @@ fn handle_controller_message(
             if decision == AuthorizationDecision::Allow {
                 flows.insert(pending.flow_id, pending.revoked);
             }
-            let _ = pending.response.send(decision);
+            let _ = pending.response.send(AuthorizationResponse {
+                decision,
+                secret_material,
+            });
         }
         ControllerMessage::Revoke { flow_id } => {
             if let Some(revoked) = flows.remove(&flow_id) {
@@ -741,10 +948,15 @@ fn disconnect(
     connection: &mut Option<Connection>,
     pending: &mut HashMap<u64, PendingAuthorization>,
     flows: &mut HashMap<u64, watch::Sender<bool>>,
+    secrets: &watch::Sender<Option<Arc<SecretsConfig>>>,
 ) {
     *connection = None;
+    let _ = secrets.send(None);
     for (_, pending) in pending.drain() {
-        let _ = pending.response.send(AuthorizationDecision::Deny);
+        let _ = pending.response.send(AuthorizationResponse {
+            decision: AuthorizationDecision::Deny,
+            secret_material: None,
+        });
     }
     for (_, revoked) in flows.drain() {
         let _ = revoked.send(true);
@@ -753,11 +965,14 @@ fn disconnect(
 
 fn deny_command(command: Command) {
     if let Command::Authorize { response, .. } = command {
-        let _ = response.send(AuthorizationDecision::Deny);
+        let _ = response.send(AuthorizationResponse {
+            decision: AuthorizationDecision::Deny,
+            secret_material: None,
+        });
     }
 }
 
-async fn connect_and_handshake(endpoint: &Path) -> io::Result<Connection> {
+async fn connect_and_handshake(endpoint: &Path) -> io::Result<(Connection, SecretsConfig)> {
     let mut stream = connect(endpoint).await?;
     write_message(
         &mut stream,
@@ -775,15 +990,30 @@ async fn connect_and_handshake(endpoint: &Path) -> io::Result<Connection> {
             )
         })?;
     match response {
-        ControllerMessage::HelloAccepted { protocol } if protocol == NETWORK_CONTROL_PROTOCOL => {
+        ControllerMessage::HelloAccepted { protocol, secrets }
+            if protocol == NETWORK_CONTROL_PROTOCOL && valid_deferred_secrets(&secrets) =>
+        {
             let (reader, writer) = tokio::io::split(stream);
-            Ok(Connection { reader, writer })
+            Ok((Connection { reader, writer }, secrets))
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Network controller rejected the protocol handshake",
         )),
     }
+}
+
+fn valid_deferred_secrets(config: &SecretsConfig) -> bool {
+    // Header blocks are authorized before they are forwarded. The existing
+    // streaming body rewriter can emit headers and earlier chunks before a
+    // later placeholder is observed, so deferred body material remains
+    // unsupported until that path can suspend and resume transactionally.
+    config.validate().is_ok()
+        && config.secrets.iter().all(|secret| {
+            secret.value.is_empty()
+                && matches!(secret.source, Some(SecretSource::Store { .. }))
+                && !secret.injection.body
+        })
 }
 
 #[cfg(unix)]
@@ -802,8 +1032,10 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    let payload = serde_json::to_vec(message)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let payload = Zeroizing::new(
+        serde_json::to_vec(message)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+    );
     let length = u32::try_from(payload.len())
         .ok()
         .filter(|length| *length as usize <= MAX_CONTROL_MESSAGE_LENGTH)
@@ -835,7 +1067,7 @@ where
             "Network control message is too large",
         ));
     }
-    let mut payload = vec![0; length];
+    let mut payload = Zeroizing::new(vec![0; length]);
     reader.read_exact(&mut payload).await?;
     serde_json::from_slice(&payload)
         .map(Some)
