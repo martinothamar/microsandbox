@@ -109,7 +109,7 @@ pub enum NetworkOperation {
         authority: String,
         /// HTTP method.
         method: String,
-        /// Request path with its query removed.
+        /// Request path with its query removed, or empty for an authority-form request.
         path: String,
         /// HTTP framing version.
         version: HttpVersion,

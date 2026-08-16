@@ -82,6 +82,14 @@ impl ConnectRequest {
 }
 
 impl ConnectTarget {
+    fn authority(&self) -> String {
+        if self.host.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+
     fn is_intercepted(&self, tls_state: &TlsState) -> bool {
         tls_state.config.intercepted_ports.contains(&self.port)
     }
@@ -537,22 +545,20 @@ pub(crate) async fn authorize_http_requests(
         return Ok(());
     };
     for request in requests {
-        let scheme = match request.scheme {
-            HttpScheme::Http => ControlHttpScheme::Http,
-            HttpScheme::Https => ControlHttpScheme::Https,
-        };
-        let version = match request.version {
-            HttpVersion::Http1 => ControlHttpVersion::Http1,
-            HttpVersion::Http2 => ControlHttpVersion::Http2,
-        };
         let grant = controller
             .authorize(NetworkOperation::HttpRequest {
                 destination,
-                scheme,
+                scheme: match request.scheme {
+                    HttpScheme::Http => ControlHttpScheme::Http,
+                    HttpScheme::Https => ControlHttpScheme::Https,
+                },
                 authority: request.authority,
                 method: request.method,
                 path: request.path,
-                version,
+                version: match request.version {
+                    HttpVersion::Http1 => ControlHttpVersion::Http1,
+                    HttpVersion::Http2 => ControlHttpVersion::Http2,
+                },
                 stream_id: request.stream_id,
             })
             .await
@@ -598,6 +604,22 @@ async fn handle_connect_tunnel(
             return Ok(());
         }
     };
+
+    if let Some(controller) = controller.as_ref() {
+        let grant = controller
+            .authorize(NetworkOperation::HttpRequest {
+                destination: guest_dst,
+                scheme: ControlHttpScheme::Http,
+                authority: connect_req.target.authority(),
+                method: "CONNECT".to_string(),
+                path: String::new(),
+                version: ControlHttpVersion::Http1,
+                stream_id: None,
+            })
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
+        drop(grant);
+    }
 
     // Dial the proxy and forward the CONNECT request so it opens the tunnel.
     let mut proxy_stream = match preconnected_proxy {
@@ -1266,6 +1288,7 @@ mod tests {
         assert_eq!(target.host, "2001:db8::1");
         assert_eq!(target.port, 8443);
         assert_eq!(target.expected_sni, None);
+        assert_eq!(target.authority(), "[2001:db8::1]:8443");
     }
 
     #[test]
