@@ -34,15 +34,23 @@ pub struct Setup {
     #[builder(default = false)]
     skip_verify: bool,
 
-    /// Force re-download even if binaries already exist.
+    /// Force reinstallation even if binaries already exist.
     #[builder(default = false)]
     force: bool,
+
+    /// Local runtime bundle to install instead of downloading a release artifact.
+    ///
+    /// The bundle must use the same `tar.gz` layout as a Microsandbox runtime
+    /// release and contain the host platform's canonical `msb` and libkrunfw
+    /// filenames.
+    #[builder(default, setter(strip_option, into))]
+    bundle_path: Option<PathBuf>,
 
     /// Allow CI to install from the workspace `build/` directory.
     #[builder(default = true)]
     allow_ci_local_bundle: bool,
 
-    /// Expected SHA-256 for the downloaded release bundle.
+    /// Expected SHA-256 for the local or downloaded release bundle.
     ///
     /// Self-downgrade supplies the digest published by the GitHub release API
     /// so target staging fails before extraction if the retained bundle bytes
@@ -73,7 +81,7 @@ impl Setup {
         Ok(())
     }
 
-    /// Download and extract the microsandbox bundle tarball.
+    /// Install the microsandbox bundle tarball.
     async fn install_bundle(&self, bin_dir: &Path, lib_dir: &Path) -> MicrosandboxResult<()> {
         let msb_name = microsandbox_utils::msb_binary_filename(std::env::consts::OS);
         let libkrunfw_name = microsandbox_utils::libkrunfw_filename(std::env::consts::OS);
@@ -92,6 +100,14 @@ impl Setup {
             return Ok(());
         }
 
+        if let Some(bundle_path) = self.bundle_path.as_deref() {
+            tracing::info!(path = %bundle_path.display(), "installing local microsandbox runtime bundle");
+            let data = tokio::fs::read(bundle_path).await?;
+            self.install_archive(&data, bin_dir, lib_dir, &libkrunfw_name)?;
+            tracing::info!("microsandbox runtime dependencies installed");
+            return Ok(());
+        }
+
         if self.allow_ci_local_bundle
             && install_ci_local_bundle(bin_dir, lib_dir, &msb_name, &libkrunfw_name).await?
         {
@@ -99,7 +115,7 @@ impl Setup {
             return Ok(());
         }
 
-        let url = microsandbox_utils::bundle_download_url(
+        let url = microsandbox_utils::runtime_bundle_download_url(
             version,
             std::env::consts::ARCH,
             std::env::consts::OS,
@@ -111,16 +127,28 @@ impl Setup {
             "downloading microsandbox runtime dependencies"
         );
         let data = download_bytes(&url).await?;
-        if let Some(expected) = self.expected_bundle_sha256.as_deref() {
-            verify_bundle_digest(&data, expected)?;
-        }
-        extract_bundle(&data, bin_dir, lib_dir)?;
+        self.install_archive(&data, bin_dir, lib_dir, &libkrunfw_name)?;
         tracing::info!("microsandbox runtime dependencies installed");
+
+        Ok(())
+    }
+
+    fn install_archive(
+        &self,
+        data: &[u8],
+        bin_dir: &Path,
+        lib_dir: &Path,
+        libkrunfw_name: &str,
+    ) -> MicrosandboxResult<()> {
+        if let Some(expected) = self.expected_bundle_sha256.as_deref() {
+            verify_bundle_digest(data, expected)?;
+        }
+        extract_bundle(data, bin_dir, lib_dir)?;
 
         // Create libkrunfw symlinks.
         #[cfg(unix)]
         {
-            let symlinks = libkrunfw_symlinks(&libkrunfw_name);
+            let symlinks = libkrunfw_symlinks(libkrunfw_name);
             for (link_name, target) in &symlinks {
                 let link_path = lib_dir.join(link_name);
                 if link_path.exists() || link_path.is_symlink() {
@@ -329,7 +357,33 @@ fn workspace_build_dir() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use super::*;
+
+    fn runtime_bundle() -> Vec<u8> {
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        for (name, contents) in [
+            (
+                microsandbox_utils::msb_binary_filename(std::env::consts::OS),
+                b"msb".as_slice(),
+            ),
+            (
+                microsandbox_utils::libkrunfw_filename(std::env::consts::OS),
+                b"libkrunfw".as_slice(),
+            ),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            archive.append_data(&mut header, name, contents).unwrap();
+        }
+        archive.into_inner().unwrap().finish().unwrap()
+    }
 
     #[test]
     fn release_bundle_digest_must_match_published_sha256() {
@@ -340,6 +394,65 @@ mod tests {
         .unwrap();
 
         let error = verify_bundle_digest(b"changed", &"0".repeat(64)).unwrap_err();
+        assert!(error.to_string().contains("SHA-256 mismatch"));
+    }
+
+    #[tokio::test]
+    async fn setup_installs_a_verified_local_runtime_bundle() {
+        let temporary = tempfile::tempdir().unwrap();
+        let bundle = runtime_bundle();
+        let digest = hex::encode(Sha256::digest(&bundle));
+        let bundle_path = temporary.path().join("runtime.tar.gz");
+        std::fs::File::create(&bundle_path)
+            .unwrap()
+            .write_all(&bundle)
+            .unwrap();
+        let install_dir = temporary.path().join("install");
+
+        Setup::builder()
+            .base_dir(&install_dir)
+            .bundle_path(&bundle_path)
+            .expected_bundle_sha256(digest)
+            .allow_ci_local_bundle(false)
+            .skip_verify(true)
+            .build()
+            .install()
+            .await
+            .unwrap();
+
+        assert!(
+            install_dir
+                .join(BIN_SUBDIR)
+                .join(microsandbox_utils::msb_binary_filename(
+                    std::env::consts::OS
+                ))
+                .is_file()
+        );
+        assert!(
+            install_dir
+                .join(LIB_SUBDIR)
+                .join(microsandbox_utils::libkrunfw_filename(std::env::consts::OS))
+                .is_file()
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_rejects_a_local_runtime_bundle_with_the_wrong_digest() {
+        let temporary = tempfile::tempdir().unwrap();
+        let bundle_path = temporary.path().join("runtime.tar.gz");
+        std::fs::write(&bundle_path, runtime_bundle()).unwrap();
+
+        let error = Setup::builder()
+            .base_dir(temporary.path().join("install"))
+            .bundle_path(bundle_path)
+            .expected_bundle_sha256("0".repeat(64))
+            .allow_ci_local_bundle(false)
+            .skip_verify(true)
+            .build()
+            .install()
+            .await
+            .unwrap_err();
+
         assert!(error.to_string().contains("SHA-256 mismatch"));
     }
 }

@@ -17,7 +17,7 @@ use microsandbox_utils::LIBKRUNFW_ABI;
 #[cfg(all(feature = "prebuilt", not(windows)))]
 use microsandbox_utils::http_client;
 #[cfg(all(feature = "prebuilt", not(windows)))]
-use microsandbox_utils::{PREBUILT_VERSION, bundle_download_url};
+use microsandbox_utils::{PREBUILT_VERSION, runtime_bundle_download_url};
 use microsandbox_utils::{
     libkrunfw_filename as utils_libkrunfw_filename,
     msb_binary_filename as utils_msb_binary_filename, resolve_home,
@@ -111,7 +111,7 @@ fn bundle_url() -> String {
     } else {
         "linux"
     };
-    bundle_download_url(PREBUILT_VERSION, arch, os)
+    runtime_bundle_download_url(PREBUILT_VERSION, arch, os)
 }
 
 #[cfg(all(feature = "prebuilt", not(windows)))]

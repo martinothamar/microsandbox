@@ -21,7 +21,7 @@ use std::process::{Command, ExitCode};
 
 #[cfg(unix)]
 use microsandbox_utils::{LIBKRUNFW_ABI, libkrunfw_filename};
-use microsandbox_utils::{PREBUILT_VERSION, bundle_download_url, msb_binary_filename};
+use microsandbox_utils::{PREBUILT_VERSION, msb_binary_filename, runtime_bundle_download_url};
 
 //--------------------------------------------------------------------------------------------------
 // Functions
@@ -150,7 +150,7 @@ fn install_runtime(bin_dir: &Path, lib_dir: &Path) -> Result<(), String> {
 
     #[cfg(unix)]
     let libkrunfw_name = libkrunfw_filename(os);
-    let url = bundle_download_url(PREBUILT_VERSION, arch, os);
+    let url = runtime_bundle_download_url(PREBUILT_VERSION, arch, os);
 
     let tmp_dir = env::temp_dir().join(format!(
         "microsandbox-install-{}-{}",

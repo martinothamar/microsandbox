@@ -4,7 +4,7 @@ use std::time::SystemTime;
 
 use microsandbox_utils::AGENTD_BINARY;
 #[cfg(feature = "prebuilt")]
-use microsandbox_utils::{PREBUILT_VERSION, agentd_download_url, http_client};
+use microsandbox_utils::{PREBUILT_VERSION, http_client, runtime_agentd_download_url};
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -49,7 +49,7 @@ fn build_agentd(workspace_root: &Path, out_dir: &Path) {
         }
 
         let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
-        let url = agentd_download_url(PREBUILT_VERSION, &arch);
+        let url = runtime_agentd_download_url(PREBUILT_VERSION, &arch);
 
         download_to(&url, &dest);
     }

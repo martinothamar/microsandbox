@@ -115,6 +115,15 @@ pub const GITHUB_ORG: &str = "superradcompany";
 /// Main repository name.
 pub const MICROSANDBOX_REPO: &str = "microsandbox";
 
+/// GitHub organization publishing the Digdir Rust SDK runtime artifacts.
+pub const RUNTIME_RELEASE_GITHUB_ORG: &str = "martinothamar";
+
+/// GitHub repository publishing the Digdir Rust SDK runtime artifacts.
+pub const RUNTIME_RELEASE_GITHUB_REPO: &str = "microsandbox";
+
+/// Tag prefix used by Digdir Rust SDK runtime releases.
+pub const RUNTIME_RELEASE_TAG_PREFIX: &str = "digdir-v";
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
@@ -228,6 +237,42 @@ pub fn bundle_download_url(version: &str, arch: &str, os: &str) -> String {
     )
 }
 
+/// Returns the GitHub release download URL for a Digdir libkrunfw runtime artifact.
+pub fn runtime_libkrunfw_download_url(version: &str, arch: &str, os: &str) -> String {
+    let (target_os, ext) = if os == "macos" {
+        ("darwin", "dylib")
+    } else if os == "windows" {
+        ("windows", "dll")
+    } else {
+        ("linux", "so")
+    };
+
+    format!(
+        "https://github.com/{RUNTIME_RELEASE_GITHUB_ORG}/{RUNTIME_RELEASE_GITHUB_REPO}/releases/download/{RUNTIME_RELEASE_TAG_PREFIX}{version}/libkrunfw-{target_os}-{arch}.{ext}"
+    )
+}
+
+/// Returns the GitHub release download URL for a Digdir agentd runtime artifact.
+pub fn runtime_agentd_download_url(version: &str, arch: &str) -> String {
+    format!(
+        "https://github.com/{RUNTIME_RELEASE_GITHUB_ORG}/{RUNTIME_RELEASE_GITHUB_REPO}/releases/download/{RUNTIME_RELEASE_TAG_PREFIX}{version}/{AGENTD_BINARY}-{arch}"
+    )
+}
+
+/// Returns the GitHub release download URL for a Digdir Rust SDK runtime bundle.
+pub fn runtime_bundle_download_url(version: &str, arch: &str, os: &str) -> String {
+    let target_os = if os == "macos" {
+        "darwin"
+    } else if os == "windows" {
+        "windows"
+    } else {
+        "linux"
+    };
+    format!(
+        "https://github.com/{RUNTIME_RELEASE_GITHUB_ORG}/{RUNTIME_RELEASE_GITHUB_REPO}/releases/download/{RUNTIME_RELEASE_TAG_PREFIX}{version}/{RUNTIME_RELEASE_GITHUB_REPO}-{target_os}-{arch}.tar.gz"
+    )
+}
+
 /// Returns an HTTP client configured for release asset downloads.
 #[cfg(feature = "http-client")]
 pub fn http_client() -> ureq::Agent {
@@ -287,6 +332,30 @@ pub fn is_windows_drive_separator_at(s: &str, index: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_digdir_runtime_urls_use_the_downstream_release_namespace() {
+        assert_eq!(
+            runtime_bundle_download_url("0.6.9-digdir.1", "x86_64", "linux"),
+            "https://github.com/martinothamar/microsandbox/releases/download/digdir-v0.6.9-digdir.1/microsandbox-linux-x86_64.tar.gz"
+        );
+        assert_eq!(
+            runtime_libkrunfw_download_url("0.6.9-digdir.1", "aarch64", "macos"),
+            "https://github.com/martinothamar/microsandbox/releases/download/digdir-v0.6.9-digdir.1/libkrunfw-darwin-aarch64.dylib"
+        );
+        assert_eq!(
+            runtime_agentd_download_url("0.6.9-digdir.1", "aarch64"),
+            "https://github.com/martinothamar/microsandbox/releases/download/digdir-v0.6.9-digdir.1/agentd-aarch64"
+        );
+    }
+
+    #[test]
+    fn test_upstream_bundle_url_remains_unchanged() {
+        assert_eq!(
+            bundle_download_url("0.6.9", "x86_64", "linux"),
+            "https://github.com/superradcompany/microsandbox/releases/download/v0.6.9/microsandbox-linux-x86_64.tar.gz"
+        );
+    }
 
     /// `MSB_HOME` is honoured verbatim (no `.microsandbox` suffix appended)
     /// so callers can isolate state per process without disturbing tooling
