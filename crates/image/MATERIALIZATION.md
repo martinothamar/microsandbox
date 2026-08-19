@@ -44,6 +44,9 @@ The immutable EROFS layer is the common boundary between acquisition and rootfs-
 
 A normal pull is complete only when every artifact required by its target is valid. Extra representations do not affect the result: a cached flat image does not satisfy `layered` unless fsmeta and VMDK also exist, and layered artifacts do not satisfy `flat` unless its verified ext4 reference exists.
 
+A valid imported flat artifact satisfies `flat` without retaining its intermediate EROFS layers.
+`layered` and `all` still require the EROFS inputs and layered composition outputs.
+
 Without `force`, a valid EROFS layer is always reusable, including when the current manifest has never been pulled before. With `force`, registry blobs and derived artifacts are rebuilt according to the existing force contract. `PullPolicy::Always` refreshes the manifest but still reuses content-addressed layers unless `force` is also set. `PullPolicy::Never` succeeds only when all artifacts required by the selected target are already present locally.
 
 ## Concurrency and failure rules
@@ -54,10 +57,32 @@ Without `force`, a valid EROFS layer is always reusable, including when the curr
 - EROFS, fsmeta, VMDK, flat blobs, and flat references are written through temporary paths and atomically renamed only after validation.
 - A failed target-specific composition leaves previously published layers usable. It must not publish a reference to an absent, partial, or size-mismatched artifact.
 
+## Prepared flat roots
+
+`export_prepared_root` packages a completed flat root as `metadata.json` plus
+`rootfs.raw.zst`. The versioned metadata binds the payload to the immutable source reference,
+platform, OCI configuration, ordered layer diff IDs, derivation digest, materializer ABI and raw
+artifact digest.
+
+`import_prepared_root` validates that contract, restores the raw image sparsely, verifies its full
+logical SHA-256 and strict ext4 structure, then publishes it through the same derivation lock,
+content-addressed blob and atomic manifest ref used by local materialization. Image metadata is
+published last. Concurrent importers therefore converge on one immutable flat artifact, and an
+interrupted or corrupt import cannot expose a partial cache hit.
+
+Registry pulls retain the descriptor digest returned for the registry's original manifest bytes,
+while `oci-client` may reserialize the parsed resolved manifest stored in cache metadata. Import
+therefore treats the pinned descriptor digest as authoritative and validates the stored manifest
+semantically: its config digest, config size and ordered layer descriptors must match the cached
+metadata, and the raw config must match both its digest and parsed runtime configuration.
+
+The bundle is transport-neutral. A caller may place it in a container image, download it directly,
+or copy it through another authenticated channel without coupling the cache to that transport.
+
 ## Security and correctness boundaries
 
 Registry descriptor digests authenticate compressed bytes; config `diff_id`s authenticate the decompressed layer stream. Reusing EROFS is permitted only after that pair has been verified during its original publication. Readers still validate the structural subset they consume and fail closed on unsupported regular-file layouts, corrupt metadata, invalid device records, missing artifacts, or inconsistent sizes. Target selection never relaxes sandbox isolation or changes the guest-visible filesystem contents.
 
 ## Storage and garbage collection
 
-Flat mode retains shared EROFS inputs as well as complete per-image ext4 outputs. This intentionally spends cache capacity to preserve cross-image acquisition reuse and fast rematerialization. Garbage collection must treat manifest metadata, fsmeta/VMDK, flat references, and active sandbox disks as roots and remove an EROFS layer only when no reachable image composition references its `diff_id`.
+Registry materialization in flat mode retains shared EROFS inputs as well as complete per-image ext4 outputs. Prepared-root import retains only the OCI metadata and complete ext4 output. Garbage collection must treat manifest metadata, fsmeta/VMDK, flat references, and active sandbox disks as roots and remove an EROFS layer only when no reachable image composition references its `diff_id`.

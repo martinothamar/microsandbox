@@ -443,8 +443,8 @@ pub(crate) fn grow_storage(
     })
 }
 
-/// Validate a newly materialized rootfs without mounting it or trusting host filesystem tools.
-pub(super) fn validate_rootfs_image(path: &Path) -> Result<(), Ext4Error> {
+/// Strictly validate a deterministic ext4 rootfs without mounting it or trusting host tools.
+pub fn validate_rootfs_image(path: &Path) -> Result<(), Ext4Error> {
     let mut file = File::open(path)?;
     let img = parse_and_validate(&mut file)?;
     if img.needs_recovery {
@@ -464,6 +464,13 @@ pub(super) fn validate_rootfs_image(path: &Path) -> Result<(), Ext4Error> {
     for group in 0..img.num_groups {
         let descriptor =
             &img.gdt[group as usize * EXT4_DESC_SIZE as usize..][..EXT4_DESC_SIZE as usize];
+        // The materializer initializes every group. Lazy-init flags would make the kernel ignore
+        // the bitmaps validated below, so a rootfs carrying them is not the image it claims to be.
+        if get_le16(descriptor, 0x12) != EXT4_BG_INODE_ZEROED {
+            return Err(unsupported(format!(
+                "group {group} of a new rootfs has lazy-initialization flags"
+            )));
+        }
         let block_bitmap = read_block_at(&mut file, geometry.group_block_bitmap_block(group))?;
         let inode_bitmap = read_block_at(&mut file, geometry.group_inode_bitmap_block(group))?;
         validate_group_bitmaps(&img, group, descriptor, &block_bitmap, &inode_bitmap)?;
@@ -1331,6 +1338,36 @@ mod tests {
             journal_blocks: 4096,
         };
         format_ext4_legacy_for_test(path, &opts).unwrap();
+    }
+
+    #[test]
+    fn new_rootfs_validation_rejects_lazy_initialized_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lazy-rootfs.ext4");
+        format_image(&path, 64 * MIB);
+        validate_rootfs_image(&path).unwrap();
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let image = parse_and_validate(&mut file).unwrap();
+        let mut descriptor = image.gdt[..EXT4_DESC_SIZE as usize].to_vec();
+        put_le16(
+            &mut descriptor,
+            0x12,
+            EXT4_BG_INODE_ZEROED | EXT4_BG_BLOCK_UNINIT,
+        );
+        put_le16(&mut descriptor, 0x1E, 0);
+        let checksum = gdt_checksum(image.csum_seed, 0, &descriptor);
+        put_le16(&mut descriptor, 0x1E, checksum);
+        file.seek(SeekFrom::Start(4096)).unwrap();
+        file.write_all(&descriptor).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        assert!(validate_rootfs_image(&path).is_err());
     }
 
     #[test]
