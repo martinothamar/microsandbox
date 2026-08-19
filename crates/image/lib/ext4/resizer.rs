@@ -357,8 +357,8 @@ pub fn grow_image(path: &Path, new_size_bytes: u64) -> Result<GrowOutcome, Ext4E
     })
 }
 
-/// Validate a newly materialized rootfs without mounting it or trusting host filesystem tools.
-pub(super) fn validate_rootfs_image(path: &Path) -> Result<(), Ext4Error> {
+/// Strictly validate a deterministic ext4 rootfs without mounting it or trusting host tools.
+pub fn validate_rootfs_image(path: &Path) -> Result<(), Ext4Error> {
     let mut file = File::open(path)?;
     let img = parse_and_validate(&mut file)?;
     if img.needs_recovery {

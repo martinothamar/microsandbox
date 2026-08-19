@@ -135,7 +135,7 @@ fn read_matching_flat_ref(
     }))
 }
 
-fn flat_derivation_digest(
+pub(crate) fn flat_derivation_digest(
     manifest_digest: &Digest,
     layer_diff_ids: &[Digest],
     platform: &Platform,
