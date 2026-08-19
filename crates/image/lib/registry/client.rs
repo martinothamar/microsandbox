@@ -1560,7 +1560,6 @@ fn resolve_cached_pull_result_for_platform(
         return Ok(None);
     };
 
-    // Check that all per-layer EROFS images exist.
     let cached_diff_ids = match metadata
         .layers
         .iter()
@@ -1570,16 +1569,13 @@ fn resolve_cached_pull_result_for_platform(
         Ok(digests) => digests,
         Err(_) => return Ok(None),
     };
-    if !cache.all_layers_materialized(&cached_diff_ids) {
-        return Ok(None);
-    }
-
     let manifest_digest = match metadata.manifest_digest.parse::<Digest>() {
         Ok(digest) => digest,
         Err(_) => return Ok(None),
     };
     if options.materialization.includes_layered()
-        && (!cache.is_fsmeta_materialized(&manifest_digest)
+        && (!cache.all_layers_materialized(&cached_diff_ids)
+            || !cache.is_fsmeta_materialized(&manifest_digest)
             || !cache.is_vmdk_materialized(&manifest_digest))
     {
         return Ok(None);
@@ -1713,16 +1709,14 @@ async fn resolve_cached_metadata_pull_result_async(
         Ok(digests) => digests,
         Err(_) => return Ok(None),
     };
-    if !all_layers_materialized_async(cache, &cached_diff_ids).await {
-        return Ok(None);
-    }
-
     let manifest_digest = match metadata.manifest_digest.parse::<Digest>() {
         Ok(digest) => digest,
         Err(_) => return Ok(None),
     };
     if materialization.includes_layered()
-        && (!cache::is_valid_erofs_artifact_async(&cache.fsmeta_erofs_path(&manifest_digest)).await
+        && (!all_layers_materialized_async(cache, &cached_diff_ids).await
+            || !cache::is_valid_erofs_artifact_async(&cache.fsmeta_erofs_path(&manifest_digest))
+                .await
             || !path_exists_async(&cache.vmdk_path(&manifest_digest)).await)
     {
         return Ok(None);
@@ -2204,6 +2198,7 @@ mod tests {
             .materialize_flat_rootfs(&manifest_digest, std::slice::from_ref(&diff_id), false)
             .await
             .unwrap();
+        std::fs::remove_file(cache.layer_erofs_path(&diff_id)).unwrap();
         std::fs::remove_file(cache.fsmeta_erofs_path(&manifest_digest)).unwrap();
         std::fs::remove_file(cache.vmdk_path(&manifest_digest)).unwrap();
 
@@ -2235,8 +2230,14 @@ mod tests {
         )
         .unwrap();
 
-        assert!(flat.is_some(), "flat should not depend on fsmeta or VMDK");
-        assert!(layered.is_none(), "layered still requires fsmeta and VMDK");
+        assert!(
+            flat.is_some(),
+            "flat should not depend on EROFS, fsmeta, or VMDK"
+        );
+        assert!(
+            layered.is_none(),
+            "layered still requires EROFS, fsmeta, and VMDK"
+        );
         assert!(all.is_none(), "all requires both representations");
     }
 

@@ -29,6 +29,7 @@ mod flat;
 pub(crate) mod layer;
 pub(crate) mod path_bytes;
 mod platform;
+mod prepared;
 mod progress;
 mod pull;
 mod registry;
@@ -52,6 +53,10 @@ pub use digest::Digest;
 pub use error::{ImageError, ImageResult};
 pub use oci_client::Reference;
 pub use platform::{Arch, Os, Platform};
+pub use prepared::{
+    PREPARED_ROOT_METADATA_FILENAME, PREPARED_ROOT_PAYLOAD_FILENAME, PreparedRootMetadata,
+    PreparedRootPlatform, export_prepared_root, import_prepared_root,
+};
 pub use progress::{PullProgress, PullProgressHandle, PullProgressSender, progress_channel};
 pub use pull::{PullOptions, PullPolicy, PullResult, RootfsMaterialization};
 pub use registry::{Registry, RegistryBuilder};
