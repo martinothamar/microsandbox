@@ -209,6 +209,9 @@ impl IcmpRelay {
                         destination: (dst_ip, 0).into(),
                         transport: TransportProtocol::Icmpv4,
                         hostname: None,
+                        // Gateway echo is answered locally before relay, so a
+                        // relayed ICMP flow is never host-destined.
+                        destination_is_host: false,
                     })
                     .await
                 {
@@ -315,6 +318,9 @@ impl IcmpRelay {
                         destination: (dst_ip, 0).into(),
                         transport: TransportProtocol::Icmpv6,
                         hostname: None,
+                        // Gateway echo is answered locally before relay, so a
+                        // relayed ICMP flow is never host-destined.
+                        destination_is_host: false,
                     })
                     .await
                 {

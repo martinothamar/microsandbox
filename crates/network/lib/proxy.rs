@@ -278,6 +278,7 @@ async fn tcp_proxy_task(
                 destination: guest_dst,
                 transport: TransportProtocol::Tcp,
                 hostname: control_hostname,
+                destination_is_host: crate::stack::is_host_destined(guest_dst, connect_dst),
             })
             .await
         {

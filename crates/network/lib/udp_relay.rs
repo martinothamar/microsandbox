@@ -417,6 +417,7 @@ async fn udp_relay_task(
                 destination: guest_dst,
                 transport: TransportProtocol::Udp,
                 hostname: None,
+                destination_is_host: crate::stack::is_host_destined(guest_dst, host_dst),
             })
             .await
         {

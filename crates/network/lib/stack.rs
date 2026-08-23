@@ -824,6 +824,14 @@ pub(crate) fn resolve_host_dst(dst: SocketAddr, gateway: GatewayIps) -> SocketAd
     }
 }
 
+/// Whether `resolve_host_dst` rewrote `dst` to host loopback, i.e. the flow is
+/// bound for the host through the gateway. The proxy tasks pass this to the host
+/// controller so it can authorize host-destined flows precisely instead of
+/// guessing which address ranges name the gateway.
+pub(crate) fn is_host_destined(dst: SocketAddr, resolved: SocketAddr) -> bool {
+    resolved.ip() != dst.ip() && resolved.ip().is_loopback()
+}
+
 /// Get the current time as a smoltcp [`Instant`] using a monotonic clock.
 ///
 /// Uses `std::time::Instant` (monotonic) instead of `SystemTime` (wall

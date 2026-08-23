@@ -126,6 +126,12 @@ pub enum NetworkOperation {
         /// Host name established by trusted protocol inspection, when available.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hostname: Option<String>,
+        /// Whether the destination was rewritten to host loopback because it is
+        /// gateway-bound. A fail-closed host controller uses this to hold
+        /// host-destined flows to its trusted endpoint instead of guessing which
+        /// address ranges name the gateway.
+        #[serde(default)]
+        destination_is_host: bool,
     },
     /// Resolve one DNS name through the host network stack.
     DnsQuery {
@@ -1093,6 +1099,7 @@ mod tests {
                 destination: "198.51.100.10:443".parse().unwrap(),
                 transport: TransportProtocol::Tcp,
                 hostname: Some("example.com".to_string()),
+                destination_is_host: false,
             },
         };
 

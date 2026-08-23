@@ -177,6 +177,7 @@ pub(crate) async fn tls_proxy_task(
                 destination: guest_dst,
                 transport: TransportProtocol::Tcp,
                 hostname: Some(sni_name.clone()),
+                destination_is_host: crate::stack::is_host_destined(guest_dst, connect_dst),
             })
             .await
         {
