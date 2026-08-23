@@ -248,13 +248,36 @@ async fn tcp_proxy_task(
         }
     }
 
+    // Controlled networking also needs the trusted HTTP authority before its
+    // transport authorization. TLS supplies that identity through SNI; for
+    // plain HTTP, finish buffering the header block and use its Host field.
+    // This must happen before `NetworkOperation::Connect`, otherwise a
+    // fail-closed controller sees `hostname: None` and rejects the flow before
+    // the later HTTP-request authorization can run.
+    let mut control_hostname = sni;
+    if controller.is_some() && control_hostname.is_none() {
+        if initial_buf.is_empty() {
+            let (peeked, peeked_sni) =
+                peek_for_sni(&mut from_smoltcp, PEEK_BUF_SIZE, PEEK_BUDGET).await;
+            initial_buf = peeked;
+            control_hostname = peeked_sni;
+        }
+        if control_hostname.is_none() {
+            let (peeked, http_host) =
+                peek_for_http_host(initial_buf, &mut from_smoltcp, PEEK_BUF_SIZE, PEEK_BUDGET)
+                    .await;
+            initial_buf = peeked;
+            control_hostname = http_host;
+        }
+    }
+
     let mut control_grant = if let Some(controller) = controller.as_ref() {
         match controller
             .authorize(NetworkOperation::Connect {
                 source: None,
                 destination: guest_dst,
                 transport: TransportProtocol::Tcp,
-                hostname: sni,
+                hostname: control_hostname,
             })
             .await
         {
@@ -1148,6 +1171,44 @@ async fn peek_for_sni(
     (buf, canonical)
 }
 
+/// Buffer a plain-HTTP first flight until its trusted Host field is available.
+///
+/// Non-HTTP protocols return immediately once their prefix cannot be an HTTP
+/// request. Slow or malformed HTTP falls through without an identity after the
+/// same bounded budget used by the SNI peek.
+async fn peek_for_http_host(
+    mut buf: Vec<u8>,
+    rx: &mut mpsc::Receiver<Bytes>,
+    max: usize,
+    budget: Duration,
+) -> (Vec<u8>, Option<String>) {
+    let timeout_fut = tokio::time::sleep(budget);
+    tokio::pin!(timeout_fut);
+
+    loop {
+        if let Some(host) = extract_http_host(&buf) {
+            return (buf, Some(host));
+        }
+        if !buf.is_empty()
+            && (!looks_like_http_request_prefix(&buf) || first_line_is_not_http_request(&buf))
+        {
+            return (buf, None);
+        }
+        if buf.len() >= max {
+            return (buf, None);
+        }
+
+        tokio::select! {
+            biased;
+            _ = &mut timeout_fut => return (buf, None),
+            data = rx.recv() => match data {
+                Some(bytes) => buf.extend_from_slice(&bytes),
+                None => return (buf, None),
+            }
+        }
+    }
+}
+
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
@@ -1365,6 +1426,37 @@ mod tests {
             elapsed < Duration::from_millis(500),
             "non-TLS bail must be fast: took {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn peek_for_http_host_buffers_split_headers() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.send(Bytes::from_static(b"GET / HTTP/1.1\r\nHo"))
+            .await
+            .unwrap();
+        tx.send(Bytes::from_static(b"st: Example.COM\r\n\r\n"))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let (buf, host) = peek_for_http_host(Vec::new(), &mut rx, PEEK_BUF_SIZE, PEEK_BUDGET).await;
+
+        assert_eq!(host.as_deref(), Some("example.com"));
+        assert_eq!(buf, b"GET / HTTP/1.1\r\nHost: Example.COM\r\n\r\n");
+    }
+
+    #[tokio::test]
+    async fn peek_for_http_host_returns_non_http_bytes_unchanged() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.send(Bytes::from_static(b"SSH-2.0-OpenSSH_10.0\r\n"))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let (buf, host) = peek_for_http_host(Vec::new(), &mut rx, PEEK_BUF_SIZE, PEEK_BUDGET).await;
+
+        assert_eq!(host, None);
+        assert_eq!(buf, b"SSH-2.0-OpenSSH_10.0\r\n");
     }
 
     //----------------------------------------------------------------------------------------------
