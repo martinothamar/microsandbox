@@ -294,6 +294,8 @@ pub struct PathsConfig {
 
     /// Secrets directory.
     pub secrets: Option<PathBuf>,
+    /// Ephemeral runtime directory.
+    pub run: Option<PathBuf>,
 }
 
 /// Default values applied to sandboxes when not overridden per-sandbox.
@@ -518,14 +520,17 @@ impl GlobalConfig {
             .unwrap_or_else(|| self.home().join(microsandbox_utils::SECRETS_SUBDIR))
     }
 
+    /// Resolve the `run` directory used for ephemeral runtime artifacts.
+    pub fn run_dir(&self) -> PathBuf {
+        self.paths
+            .run
+            .clone()
+            .unwrap_or_else(|| self.home().join(microsandbox_utils::RUN_SUBDIR))
+    }
+
     /// Resolve the `ssh` directory used for host-side SSH state.
     pub fn ssh_dir(&self) -> PathBuf {
         self.home().join(microsandbox_utils::SSH_SUBDIR)
-    }
-
-    /// Resolve the `run` directory used for ephemeral runtime artifacts.
-    pub fn run_dir(&self) -> PathBuf {
-        self.home().join(microsandbox_utils::RUN_SUBDIR)
     }
 
     /// Resolve the optional diagnostic file under `run/metrics` that records
@@ -780,7 +785,8 @@ mod tests {
                 "volumes": "/configured/volumes",
                 "snapshots": "/configured/snapshots",
                 "logs": "/configured/logs",
-                "secrets": "/configured/secrets"
+                "secrets": "/configured/secrets",
+                "run": "/configured/run"
             },
             "sandbox_defaults": {
                 "cpus": 4,
@@ -850,6 +856,7 @@ mod tests {
             &patch.paths.snapshots,
             &patch.paths.logs,
             &patch.paths.secrets,
+            &patch.paths.run,
         ] {
             assert_eq!(path, &Some(None));
         }

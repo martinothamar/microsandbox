@@ -234,6 +234,11 @@ impl LocalBackend {
         self.config().secrets_dir()
     }
 
+    /// Resolved ephemeral runtime directory.
+    pub fn run_dir(&self) -> PathBuf {
+        self.config().run_dir()
+    }
+
     /// Warn about create-time options only a cloud backend can honor.
     /// These are inert locally, so the create proceeds without them.
     pub(super) fn warn_cloud_only(&self, name: &str, slug: Option<&str>) {
@@ -339,6 +344,12 @@ impl LocalBackendBuilder {
     /// Override the secrets directory.
     pub fn secrets_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.config.paths.secrets_mut(path.into());
+        self
+    }
+
+    /// Override the ephemeral runtime directory.
+    pub fn run_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.config.paths.run_mut(path.into());
         self
     }
 
@@ -921,6 +932,23 @@ mod tests {
             overridden.spec.resources.thp,
             microsandbox_types::TransparentHugePagePolicy::Never
         );
+    }
+
+    #[tokio::test]
+    async fn builder_run_dir_overrides_the_home_run_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_dir = temp.path().join("short-run");
+        let backend = LocalBackend::builder()
+            .config_path(temp.path().join("config.json"))
+            .managed_config_path(temp.path().join("managed.json"))
+            .home(temp.path().join("home"))
+            .run_dir(&run_dir)
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(backend.run_dir(), run_dir);
+        assert_eq!(backend.config().run_dir(), run_dir);
     }
 
     #[tokio::test]

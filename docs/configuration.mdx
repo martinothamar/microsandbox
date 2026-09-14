@@ -42,7 +42,8 @@ See [Managed deployment](/enterprise/managed-configuration) for deployment, prec
     "volumes": null,
     "snapshots": null,
     "logs": null,
-    "secrets": null
+    "secrets": null,
+    "run": null
   },
   "sandbox_defaults": {
     "cpus": 2,
@@ -178,6 +179,7 @@ On Windows, the default `home` is `%USERPROFILE%\.microsandbox`. JSON strings ca
 | `snapshots` | `{home}/snapshots` | Snapshot artifacts |
 | `logs` | `{home}/logs` | Sandbox logs |
 | `secrets` | `{home}/secrets` | Secrets. Registry secrets live under `secrets/registries/` |
+| `run` | `{home}/run` | Ephemeral runtime artifacts: sockets, lifecycle locks and leases. Keep the path short enough for Unix socket paths. |
 
 Runtime path settings are captured during local backend construction, with managed paths taking precedence. Existing backend handles keep their settings until replaced.
 
