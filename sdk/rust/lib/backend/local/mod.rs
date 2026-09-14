@@ -85,6 +85,7 @@ pub struct LocalBackendBuilder {
     cache_dir: Option<PathBuf>,
     logs_dir: Option<PathBuf>,
     secrets_dir: Option<PathBuf>,
+    run_dir: Option<PathBuf>,
     max_connections: Option<u32>,
     connect_timeout_secs: Option<u64>,
     busy_timeout_secs: Option<u64>,
@@ -217,6 +218,9 @@ impl LocalBackend {
     pub fn secrets_dir(&self) -> PathBuf {
         self.config.secrets_dir()
     }
+
+    /// Resolved ephemeral runtime directory.
+    pub fn run_dir(&self) -> PathBuf { self.config.run_dir() }
 
     /// Enables or disables host-controlled networking for a local Sandbox.
     ///
@@ -368,6 +372,12 @@ impl LocalBackendBuilder {
         self
     }
 
+    /// Override the ephemeral runtime directory.
+    pub fn run_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.run_dir = Some(path.into());
+        self
+    }
+
     /// Override the DB max connections (default: 5).
     pub fn max_connections(mut self, n: u32) -> Self {
         self.max_connections = Some(n);
@@ -503,6 +513,7 @@ impl LocalBackendBuilder {
             cache_dir,
             logs_dir,
             secrets_dir,
+            run_dir,
             max_connections,
             connect_timeout_secs,
             busy_timeout_secs,
@@ -555,6 +566,9 @@ impl LocalBackendBuilder {
         }
         if let Some(p) = secrets_dir {
             base.paths.secrets = Some(p);
+        }
+        if let Some(p) = run_dir {
+            base.paths.run = Some(p);
         }
 
         if let Some(v) = default_cpus {
