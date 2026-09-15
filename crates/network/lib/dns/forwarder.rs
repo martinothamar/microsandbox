@@ -48,6 +48,9 @@ use super::nameserver::read_host_dns_servers;
 use super::nameserver::resolve_nameservers;
 #[cfg(windows)]
 use super::windows_resolver::WindowsSystemResolver;
+use crate::control::{
+    NetworkControlClient, NetworkOperation, TransportProtocol, wait_for_revocation,
+};
 use crate::netstack::{
     poll::GatewayIps,
     shared::{ResolvedHostnameFamily, SharedState},
@@ -113,6 +116,8 @@ pub(crate) struct DnsForwarder {
     /// `host.microsandbox.internal`.
     gateway: GatewayIps,
     config: Arc<NormalizedDnsConfig>,
+    /// Host authorization endpoint selected for controlled networking.
+    controller: Option<NetworkControlClient>,
 }
 
 /// One configured upstream and its per-transport clients.
@@ -319,26 +324,70 @@ impl DnsForwarder {
             return Some(response);
         }
 
+        // Controlled networking authorizes the query before any upstream is
+        // contacted and holds the grant for the whole in-flight query.
+        let mut control_grant = match &self.controller {
+            Some(controller) => {
+                let resolver = original_dst
+                    .filter(|address| !self.gateway_ips.contains(address))
+                    .map(|address| SocketAddr::new(address, transport.upstream_port()));
+                let control_transport = match transport {
+                    Transport::Udp => TransportProtocol::Udp,
+                    Transport::Tcp | Transport::Dot => TransportProtocol::Tcp,
+                };
+                match controller
+                    .authorize(NetworkOperation::DnsQuery {
+                        name: domain.clone(),
+                        record_type: query_type.to_string(),
+                        resolver,
+                        transport: control_transport,
+                    })
+                    .await
+                {
+                    Ok(grant) => Some(grant),
+                    Err(error) => {
+                        tracing::debug!(domain = %domain, %error, "DNS query denied by host controller");
+                        return build_status_response(&query_msg, ResponseCode::NXDomain);
+                    }
+                }
+            }
+            None => None,
+        };
+
         // Pick upstream based on where the guest aimed and the network
         // policy, then forward. On the configured path, walk the
         // upstreams in order so a timeout or transport failure falls
         // over to the next one; the guest was handed the gateway as its
         // only nameserver, so it cannot retry elsewhere itself.
-        let response = match self.select_upstream(original_dst, transport, sni).await {
-            UpstreamChoice::PolicyDenied => {
-                tracing::debug!(
-                    domain = %domain,
-                    ?original_dst,
-                    "DNS resolver denied by network policy"
-                );
+        let upstream = async {
+            match self.select_upstream(original_dst, transport, sni).await {
+                UpstreamChoice::PolicyDenied => Err(()),
+                UpstreamChoice::ServFail => Ok(None),
+                UpstreamChoice::Direct(client) => {
+                    Ok(self.send_query(&client, &query_msg, &domain).await)
+                }
+                UpstreamChoice::Configured => Ok(self
+                    .forward_to_configured(raw_query, &query_msg, &domain, transport)
+                    .await),
+            }
+        };
+        let response = tokio::select! {
+            biased;
+            () = wait_for_revocation(&mut control_grant) => {
+                tracing::debug!(domain = %domain, "DNS query revoked by host controller");
                 return build_status_response(&query_msg, ResponseCode::NXDomain);
             }
-            UpstreamChoice::ServFail => None,
-            UpstreamChoice::Direct(client) => self.send_query(&client, &query_msg, &domain).await,
-            UpstreamChoice::Configured => {
-                self.forward_to_configured(raw_query, &query_msg, &domain, transport)
-                    .await
-            }
+            result = upstream => match result {
+                Ok(response) => response,
+                Err(()) => {
+                    tracing::debug!(
+                        domain = %domain,
+                        ?original_dst,
+                        "DNS resolver denied by network policy"
+                    );
+                    return build_status_response(&query_msg, ResponseCode::NXDomain);
+                }
+            },
         };
         let Some(mut response_msg) = response else {
             return build_status_response(&query_msg, ResponseCode::ServFail);
@@ -578,6 +627,7 @@ impl DnsForwarder {
         platform_policy: Option<Arc<NetworkPolicy>>,
         shared: Arc<SharedState>,
         gateway: GatewayIps,
+        controller: Option<NetworkControlClient>,
     ) -> DnsForwarderHandle {
         let (forwarder_tx, forwarder_rx) = watch::channel(None);
         handle.spawn(async move {
@@ -588,6 +638,7 @@ impl DnsForwarder {
                 platform_policy,
                 shared,
                 gateway,
+                controller,
             )
             .await
             else {
@@ -610,6 +661,7 @@ impl DnsForwarder {
         platform_policy: Option<Arc<NetworkPolicy>>,
         shared: Arc<SharedState>,
         gateway: GatewayIps,
+        controller: Option<NetworkControlClient>,
     ) -> Option<Arc<Self>> {
         let configured = if !config.nameservers.is_empty() {
             match resolve_nameservers(&config.nameservers).await {
@@ -659,6 +711,7 @@ impl DnsForwarder {
             shared,
             gateway,
             config,
+            controller,
         }))
     }
 
@@ -737,6 +790,7 @@ impl DnsForwarder {
             shared,
             gateway,
             config,
+            controller: None,
         })
     }
 }
@@ -1113,6 +1167,7 @@ mod tests {
                 ipv6: None,
             },
             config,
+            controller: None,
         })
     }
 
@@ -1133,6 +1188,96 @@ mod tests {
             RData::A(a) => Some(Ipv4Addr::from(*a)),
             _ => None,
         })
+    }
+
+    async fn controlled_forwarder(
+        upstream: SocketAddr,
+        query_timeout: Duration,
+        controller: &crate::control::test_support::TestController,
+    ) -> Arc<DnsForwarder> {
+        let mut forwarder = forwarder_over(&[upstream]).await;
+        let forwarder_mut = Arc::get_mut(&mut forwarder).expect("unique test forwarder");
+        forwarder_mut.controller = Some(controller.client());
+        forwarder_mut.config = Arc::new(NormalizedDnsConfig {
+            rebind_protection: false,
+            nameservers: Vec::new(),
+            query_timeout,
+        });
+        forwarder
+    }
+
+    fn response_code(bytes: &Bytes) -> ResponseCode {
+        Message::from_bytes(bytes)
+            .expect("parse response")
+            .metadata
+            .response_code
+    }
+
+    #[tokio::test]
+    async fn controlled_dns_denial_never_consults_the_upstream() {
+        use crate::control::test_support::{TestController, TestDecision};
+        use crate::control::{NetworkOperation, TransportProtocol};
+
+        let controller = TestController::start(TestDecision::Deny).await;
+        let (upstream, hits) = responding_udp(Ipv4Addr::new(10, 0, 0, 7)).await;
+        let forwarder =
+            controlled_forwarder(upstream, Duration::from_millis(300), &controller).await;
+        let raw = make_query("example.com.", RecordType::A)
+            .to_bytes()
+            .expect("encode query");
+        let gateway: IpAddr = "10.0.0.1".parse().unwrap();
+
+        let response = forwarder
+            .forward(&raw, Some(gateway), Transport::Udp, None)
+            .await
+            .expect("a denied query gets a synthetic answer");
+
+        assert_eq!(response_code(&response), ResponseCode::NXDomain);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "denied query must not reach upstream"
+        );
+        let operations = controller.wait_for_operations(1).await;
+        assert!(
+            matches!(
+                &operations[0],
+                NetworkOperation::DnsQuery { name, record_type, resolver: None, transport: TransportProtocol::Udp }
+                    if name == "example.com" && record_type == "A"
+            ),
+            "{operations:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn controlled_dns_revocation_ends_an_in_flight_query() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let controller = TestController::start(TestDecision::Allow).await;
+        let upstream = blackhole_udp().await;
+        let forwarder = controlled_forwarder(upstream, Duration::from_secs(30), &controller).await;
+        let raw = make_query("example.com.", RecordType::A)
+            .to_bytes()
+            .expect("encode query");
+        let gateway: IpAddr = "10.0.0.1".parse().unwrap();
+
+        let query = {
+            let forwarder = forwarder.clone();
+            tokio::spawn(async move {
+                forwarder
+                    .forward(&raw, Some(gateway), Transport::Udp, None)
+                    .await
+            })
+        };
+        controller.wait_for_operations(1).await;
+        controller.revoke_all().await;
+
+        let response = tokio::time::timeout(Duration::from_secs(5), query)
+            .await
+            .expect("revocation must end the query before its upstream timeout")
+            .unwrap()
+            .expect("a revoked query gets a synthetic answer");
+        assert_eq!(response_code(&response), ResponseCode::NXDomain);
     }
 
     #[tokio::test]

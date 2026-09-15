@@ -17,6 +17,7 @@ use smoltcp::wire::{
     Icmpv6Packet, Icmpv6Repr, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr,
 };
 
+use crate::control::{NetworkControlClient, NetworkOperation, TransportProtocol, unless_revoked};
 use crate::netstack::{poll::PollLoopConfig, shared::SharedState};
 use crate::policy::{NetworkPolicy, Protocol};
 
@@ -69,6 +70,7 @@ pub struct IcmpRelay {
     tokio_handle: tokio::runtime::Handle,
     backend_v4: EchoBackend,
     backend_v6: EchoBackend,
+    controller: Option<NetworkControlClient>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -82,6 +84,7 @@ impl IcmpRelay {
         gateway_mac: [u8; 6],
         guest_mac: [u8; 6],
         tokio_handle: tokio::runtime::Handle,
+        controller: Option<NetworkControlClient>,
     ) -> Self {
         let backend_v4 = probe_icmp_socket_v4();
         let backend_v6 = probe_icmp_socket_v6();
@@ -104,6 +107,7 @@ impl IcmpRelay {
             tokio_handle,
             backend_v4,
             backend_v6,
+            controller,
         }
     }
 
@@ -193,20 +197,55 @@ impl IcmpRelay {
 
         tracing::debug!(dst = %dst_ip, seq_no, bytes = echo_data.len(), "relaying ICMPv4 echo request");
 
+        let controller = self.controller.clone();
         self.tokio_handle.spawn(async move {
-            if let Err(e) = icmpv4_echo_task(
-                dst_ip,
-                src_ip,
-                guest_ident,
-                seq_no,
-                echo_data,
-                shared,
-                gateway_mac,
-                guest_mac,
+            let mut grant = match controller {
+                Some(controller) => {
+                    match controller
+                        .authorize(NetworkOperation::Connect {
+                            source: Some((src_ip, 0).into()),
+                            destination: (dst_ip, 0).into(),
+                            transport: TransportProtocol::Icmpv4,
+                            hostname: None,
+                            // Gateway echo is answered locally before relay, so a
+                            // relayed ICMP flow is never host-destined.
+                            destination_is_host: false,
+                        })
+                        .await
+                    {
+                        Ok(grant) => Some(grant),
+                        Err(error) => {
+                            tracing::debug!(dst = %dst_ip, %error, "ICMPv4 egress denied by host controller");
+                            return;
+                        }
+                    }
+                }
+                None => None,
+            };
+            // Revocation is checked before the echo task is first polled, so an
+            // already-revoked grant sends nothing.
+            match unless_revoked(
+                &mut grant,
+                icmpv4_echo_task(
+                    dst_ip,
+                    src_ip,
+                    guest_ident,
+                    seq_no,
+                    echo_data,
+                    shared,
+                    gateway_mac,
+                    guest_mac,
+                ),
             )
             .await
             {
-                tracing::debug!(dst = %dst_ip, error = %e, "ICMPv4 echo relay failed");
+                Some(Err(e)) => {
+                    tracing::debug!(dst = %dst_ip, error = %e, "ICMPv4 echo relay failed");
+                }
+                Some(Ok(())) => {}
+                None => {
+                    tracing::debug!(dst = %dst_ip, "ICMPv4 flow revoked by host controller");
+                }
             }
         });
 
@@ -274,20 +313,55 @@ impl IcmpRelay {
 
         tracing::debug!(dst = %dst_ip, seq_no, bytes = echo_data.len(), "relaying ICMPv6 echo request");
 
+        let controller = self.controller.clone();
         self.tokio_handle.spawn(async move {
-            if let Err(e) = icmpv6_echo_task(
-                dst_ip,
-                src_ip,
-                guest_ident,
-                seq_no,
-                echo_data,
-                shared,
-                gateway_mac,
-                guest_mac,
+            let mut grant = match controller {
+                Some(controller) => {
+                    match controller
+                        .authorize(NetworkOperation::Connect {
+                            source: Some((src_ip, 0).into()),
+                            destination: (dst_ip, 0).into(),
+                            transport: TransportProtocol::Icmpv6,
+                            hostname: None,
+                            // Gateway echo is answered locally before relay, so a
+                            // relayed ICMP flow is never host-destined.
+                            destination_is_host: false,
+                        })
+                        .await
+                    {
+                        Ok(grant) => Some(grant),
+                        Err(error) => {
+                            tracing::debug!(dst = %dst_ip, %error, "ICMPv6 egress denied by host controller");
+                            return;
+                        }
+                    }
+                }
+                None => None,
+            };
+            // Revocation is checked before the echo task is first polled, so an
+            // already-revoked grant sends nothing.
+            match unless_revoked(
+                &mut grant,
+                icmpv6_echo_task(
+                    dst_ip,
+                    src_ip,
+                    guest_ident,
+                    seq_no,
+                    echo_data,
+                    shared,
+                    gateway_mac,
+                    guest_mac,
+                ),
             )
             .await
             {
-                tracing::debug!(dst = %dst_ip, error = %e, "ICMPv6 echo relay failed");
+                Some(Err(e)) => {
+                    tracing::debug!(dst = %dst_ip, error = %e, "ICMPv6 echo relay failed");
+                }
+                Some(Ok(())) => {}
+                None => {
+                    tracing::debug!(dst = %dst_ip, "ICMPv6 flow revoked by host controller");
+                }
             }
         });
 

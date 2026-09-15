@@ -69,6 +69,11 @@ pub struct SandboxArgs {
     #[arg(long = "forward")]
     pub forward_output: bool,
 
+    /// Require the runtime-to-host Network authorization protocol.
+    #[cfg(feature = "net")]
+    #[arg(long = "network-controlled", hide = true)]
+    pub network_controlled: bool,
+
     /// Number of virtual CPUs.
     #[arg(long, default_value_t = 1)]
     pub vcpus: u8,
@@ -274,6 +279,8 @@ pub fn run(args: SandboxArgs) -> ! {
         writeback_lease_dir: launch.writeback_lease_dir,
         block_writeback_pool_bytes: launch.block_writeback_pool_bytes,
         agent_sock_path: launch.agent_sock,
+        #[cfg(feature = "net")]
+        network_controlled: args.network_controlled,
         startup_command: launch.startup,
         #[cfg(unix)]
         startup_fd,
@@ -654,6 +661,8 @@ mod tests {
             #[cfg(windows)]
             startup_pipe: None,
             forward_output: false,
+            #[cfg(feature = "net")]
+            network_controlled: false,
             vcpus: 1,
             memory_mib: 512,
             max_vcpus: None,

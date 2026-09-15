@@ -17,6 +17,10 @@ use tokio::sync::mpsc;
 
 use super::sni;
 use super::state::TlsState;
+use crate::control::{
+    NetworkControlClient, NetworkGrant, NetworkOperation, TransportProtocol, wait_for_revocation,
+};
+use crate::netstack::poll::is_host_destined;
 use crate::netstack::shared::SharedState;
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::proxy::ResolvedOutboundProxy;
@@ -58,6 +62,10 @@ pub(crate) struct TlsProxy {
     via_connect: bool,
     /// ClientHello bytes already consumed from the guest stream.
     initial_buf: Vec<u8>,
+    /// Host controller used for connection authorization.
+    controller: Option<NetworkControlClient>,
+    /// Existing transport grant when the connection arrived through the TCP proxy.
+    control_grant: Option<NetworkGrant>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -94,7 +102,21 @@ impl TlsProxy {
             expected_sni: None,
             via_connect: false,
             initial_buf: Vec::new(),
+            controller: None,
+            control_grant: None,
         }
+    }
+
+    /// Require fail-closed host authorization for this connection.
+    pub(crate) fn with_controller(mut self, controller: Option<NetworkControlClient>) -> Self {
+        self.controller = controller;
+        self
+    }
+
+    /// Reuse the transport grant obtained before the connection was handed over.
+    pub(crate) fn with_control_grant(mut self, control_grant: Option<NetworkGrant>) -> Self {
+        self.control_grant = control_grant;
+        self
     }
 
     /// Reuse an already connected upstream stream.
@@ -151,6 +173,8 @@ impl TlsProxy {
             expected_sni,
             via_connect,
             initial_buf,
+            controller,
+            mut control_grant,
         } = self;
         let connect_dst = connect_target.primary();
 
@@ -219,6 +243,32 @@ impl TlsProxy {
             return Ok(());
         }
 
+        // A connection handed over by the TCP proxy already holds a grant;
+        // a directly intercepted port authorizes here, with the SNI as the
+        // trusted hostname.
+        if control_grant.is_none()
+            && let Some(controller) = controller.as_ref()
+        {
+            match controller
+                .authorize(NetworkOperation::Connect {
+                    source: None,
+                    destination: guest_dst,
+                    transport: TransportProtocol::Tcp,
+                    hostname: Some(sni_name.clone()),
+                    destination_is_host: is_host_destined(guest_dst, connect_dst),
+                })
+                .await
+            {
+                Ok(grant) => control_grant = Some(grant),
+                Err(error) => {
+                    tracing::debug!(dst = %guest_dst, %error, "TLS egress denied by host controller");
+                    proxy_connect.mark_policy_denied();
+                    shared.proxy_wake.wake();
+                    return Ok(());
+                }
+            }
+        }
+
         if should_bypass {
             tracing::debug!(sni = %sni_name, dst = %connect_dst, guest_dst = %guest_dst, "TLS bypass");
             bypass_relay(
@@ -230,6 +280,7 @@ impl TlsProxy {
                 proxy_connect,
                 upstream_stream,
                 outbound_proxy,
+                control_grant,
             )
             .await
         } else {
@@ -247,6 +298,7 @@ impl TlsProxy {
                 proxy_connect,
                 upstream_stream,
                 outbound_proxy,
+                control_grant,
             )
             .await
         }
@@ -268,16 +320,32 @@ async fn bypass_relay(
     proxy_connect: Arc<ProxyConnectState>,
     upstream_stream: Option<TcpStream>,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
+    mut control_grant: Option<NetworkGrant>,
 ) -> io::Result<()> {
-    let mut server = match upstream_stream {
-        Some(s) => s,
-        None => {
-            connect_target
-                .connect(&proxy_connect, &shared, outbound_proxy.as_deref())
-                .await?
-        }
+    // The connect and the buffered ClientHello replay both race revocation:
+    // a revoked grant must not open the host socket or write the first flight.
+    let connect_and_replay = async {
+        let mut server = match upstream_stream {
+            Some(s) => s,
+            None => {
+                connect_target
+                    .connect(&proxy_connect, &shared, outbound_proxy.as_deref())
+                    .await?
+            }
+        };
+        server.write_all(&initial_buf).await?;
+        Ok::<_, io::Error>(server)
     };
-    server.write_all(&initial_buf).await?;
+    let server = tokio::select! {
+        biased;
+        () = wait_for_revocation(&mut control_grant) => {
+            tracing::debug!(dst = %connect_target.primary(), "TLS bypass flow revoked by host controller before relay");
+            proxy_connect.mark_policy_denied();
+            shared.proxy_wake.wake();
+            return Ok(());
+        }
+        result = connect_and_replay => result?,
+    };
 
     let (mut server_rx, mut server_tx) = server.into_split();
     let mut buf = vec![0u8; RELAY_BUF_SIZE];
@@ -285,6 +353,10 @@ async fn bypass_relay(
     let mut guest_eof = false;
     loop {
         tokio::select! {
+            () = wait_for_revocation(&mut control_grant) => {
+                tracing::debug!(dst = %connect_target.primary(), "TLS bypass flow revoked by host controller");
+                break;
+            }
             data = from_smoltcp.recv(), if !guest_eof => {
                 match data {
                     Some(bytes) => server_tx.write_all(&bytes).await?,
@@ -331,6 +403,7 @@ pub(crate) async fn intercept_relay(
     proxy_connect: Arc<ProxyConnectState>,
     upstream_stream: Option<TcpStream>,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
+    mut control_grant: Option<NetworkGrant>,
 ) -> io::Result<()> {
     // Per-connection snapshot: live secret updates apply to later connections.
     let secrets = tls_state.secrets.load();
@@ -367,64 +440,82 @@ pub(crate) async fn intercept_relay(
     // Send ServerHello etc. back to guest.
     flush_to_guest(&mut guest_tls, &to_smoltcp, &shared, &mut tls_buf).await?;
 
-    // Complete guest-facing TLS handshake with timeout to prevent resource exhaustion.
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while guest_tls.is_handshaking() {
-            let data = from_smoltcp
-                .recv()
-                .await
-                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "channel closed"))?;
-            let mut remaining = &data[..];
-            while !remaining.is_empty() {
-                guest_tls
-                    .read_tls(&mut remaining)
-                    .map_err(io::Error::other)?;
-                guest_tls.process_new_packets().map_err(io::Error::other)?;
-            }
-            flush_to_guest(&mut guest_tls, &to_smoltcp, &shared, &mut tls_buf).await?;
-        }
-        Ok::<_, io::Error>(())
-    })
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))??;
-
-    // Connect to real server with TLS.
-    let server_stream = match upstream_stream {
-        Some(s) => s,
-        None => {
-            connect_target
-                .connect(&proxy_connect, &shared, outbound_proxy.as_deref())
-                .await?
-        }
-    };
-    let server_name = ServerName::try_from(sni_name.to_string())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let mut server_tls = tls_state
-        .upstream_connector_for(sni_name)
-        .connect(server_name, server_stream)
-        .await
-        .map_err(io::Error::other)?;
-
-    // Phase 2: Bidirectional plaintext relay.
+    // Both handshakes and the first decrypted request race revocation: a
+    // revoked grant must not open the host socket, complete the upstream
+    // handshake or forward the first flight.
     let mut server_buf = vec![0u8; RELAY_BUF_SIZE];
     let mut plaintext_buf = vec![0u8; RELAY_BUF_SIZE];
+    let establish = async {
+        // Complete guest-facing TLS handshake with timeout to prevent resource exhaustion.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while guest_tls.is_handshaking() {
+                let data = from_smoltcp.recv().await.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "channel closed")
+                })?;
+                let mut remaining = &data[..];
+                while !remaining.is_empty() {
+                    guest_tls
+                        .read_tls(&mut remaining)
+                        .map_err(io::Error::other)?;
+                    guest_tls.process_new_packets().map_err(io::Error::other)?;
+                }
+                flush_to_guest(&mut guest_tls, &to_smoltcp, &shared, &mut tls_buf).await?;
+            }
+            Ok::<_, io::Error>(())
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))??;
 
-    // Drain any application data already buffered during the TLS handshake.
-    // In TLS 1.3, the client sends Finished + application data in the same
-    // flight, so process_new_packets() during the handshake loop may have
-    // already decrypted the first HTTP request into the plaintext buffer.
-    forward_plaintext(
-        &mut guest_tls,
-        &mut server_tls,
-        &mut secrets_handler,
-        &shared,
-        &mut plaintext_buf,
-    )
-    .await?;
+        // Connect to real server with TLS.
+        let server_stream = match upstream_stream {
+            Some(s) => s,
+            None => {
+                connect_target
+                    .connect(&proxy_connect, &shared, outbound_proxy.as_deref())
+                    .await?
+            }
+        };
+        let server_name = ServerName::try_from(sni_name.to_string())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let mut server_tls = tls_state
+            .upstream_connector_for(sni_name)
+            .connect(server_name, server_stream)
+            .await
+            .map_err(io::Error::other)?;
 
+        // Drain any application data already buffered during the TLS handshake.
+        // In TLS 1.3, the client sends Finished + application data in the same
+        // flight, so process_new_packets() during the handshake loop may have
+        // already decrypted the first HTTP request into the plaintext buffer.
+        forward_plaintext(
+            &mut guest_tls,
+            &mut server_tls,
+            &mut secrets_handler,
+            &shared,
+            &mut plaintext_buf,
+        )
+        .await?;
+        Ok::<_, io::Error>(server_tls)
+    };
+    let mut server_tls = tokio::select! {
+        biased;
+        () = wait_for_revocation(&mut control_grant) => {
+            tracing::debug!(dst = %guest_dst, "TLS flow revoked by host controller before relay");
+            proxy_connect.mark_policy_denied();
+            shared.proxy_wake.wake();
+            return Ok(());
+        }
+        result = establish => result?,
+    };
+
+    // Phase 2: Bidirectional plaintext relay.
     let mut guest_eof = false;
     loop {
         tokio::select! {
+            () = wait_for_revocation(&mut control_grant) => {
+                tracing::debug!(dst = %guest_dst, "TLS flow revoked by host controller");
+                break;
+            }
             // Guest → server: receive encrypted, decrypt, forward plaintext.
             data = from_smoltcp.recv(), if !guest_eof => {
                 let data = match data {
@@ -599,4 +690,170 @@ async fn flush_to_guest(
         }
     }
     Ok(())
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::control::test_support::{TestController, TestDecision};
+    use crate::control::{NetworkOperation, TransportProtocol};
+    use crate::secrets::config::SecretsConfig;
+    use crate::secrets::handle::SecretsHandle;
+    use crate::tcp::connection::ProxyConnectStatus;
+    use crate::tcp::proxy::tests::{StalledSocks5Server, synthetic_client_hello};
+
+    /// A genuine ClientHello for `api.example.com`, produced by rustls, so
+    /// the guest-facing server accepts it and waits for the client's next
+    /// flight.
+    fn real_client_hello() -> Vec<u8> {
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(config),
+            ServerName::try_from("api.example.com").unwrap(),
+        )
+        .unwrap();
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello).unwrap();
+        hello
+    }
+
+    fn tls_state(bypass: Vec<String>) -> Arc<TlsState> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config = microsandbox_types::TlsConfig {
+            enabled: true,
+            bypass,
+            ..microsandbox_types::TlsConfig::default()
+        };
+        Arc::new(TlsState::new(config, SecretsHandle::new(SecretsConfig::default())).unwrap())
+    }
+
+    fn controlled_tls_proxy(
+        guest_dst: SocketAddr,
+        tls_state: Arc<TlsState>,
+        controller: &TestController,
+        outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
+        client_hello: Vec<u8>,
+    ) -> (TlsProxy, Arc<ProxyConnectState>, mpsc::Receiver<Bytes>) {
+        let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
+        // The guest-facing receiver stays alive so ServerHello can be delivered.
+        let (to_tx, to_rx) = mpsc::channel::<Bytes>(8);
+        from_tx.try_send(Bytes::from(client_hello)).unwrap();
+        // The guest never continues its handshake; keep its side open.
+        std::mem::forget(from_tx);
+        let proxy_connect = Arc::new(ProxyConnectState::new());
+        let proxy = TlsProxy::new(
+            guest_dst,
+            UpstreamTcpTarget::direct(guest_dst),
+            from_rx,
+            to_tx,
+            Arc::new(SharedState::new(4)),
+            tls_state,
+            Arc::new(NetworkPolicy::allow_all()),
+            false,
+            proxy_connect.clone(),
+            outbound_proxy,
+        )
+        .with_controller(Some(controller.client()));
+        (proxy, proxy_connect, to_rx)
+    }
+
+    #[tokio::test]
+    async fn controlled_tls_denial_never_opens_a_host_socket() {
+        let controller = TestController::start(TestDecision::Deny).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let guest_dst = listener.local_addr().unwrap();
+        let (proxy, proxy_connect, _to_guest) = controlled_tls_proxy(
+            guest_dst,
+            tls_state(Vec::new()),
+            &controller,
+            None,
+            synthetic_client_hello("api.example.com"),
+        );
+
+        proxy.try_run().await.unwrap();
+
+        assert_eq!(proxy_connect.status(), ProxyConnectStatus::PolicyDenied);
+        let operations = controller.wait_for_operations(1).await;
+        assert!(
+            matches!(
+                &operations[0],
+                NetworkOperation::Connect { destination, transport: TransportProtocol::Tcp, hostname: Some(hostname), .. }
+                    if *destination == guest_dst && hostname == "api.example.com"
+            ),
+            "{operations:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn controlled_tls_intercept_revocation_during_guest_handshake_never_dials_upstream() {
+        let controller = TestController::start(TestDecision::Allow).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let guest_dst = listener.local_addr().unwrap();
+        let (proxy, proxy_connect, _to_guest) = controlled_tls_proxy(
+            guest_dst,
+            tls_state(Vec::new()),
+            &controller,
+            None,
+            real_client_hello(),
+        );
+        let run = tokio::spawn(proxy.try_run());
+
+        // The guest-facing handshake waits for the client's second flight,
+        // which never arrives, so the revocation lands inside that window.
+        controller.wait_for_operations(1).await;
+        controller.revoke_all().await;
+
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("revocation must end the proxy task")
+            .unwrap()
+            .unwrap();
+        assert_eq!(proxy_connect.status(), ProxyConnectStatus::PolicyDenied);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "a revoked intercept must not connect upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn controlled_tls_bypass_revocation_during_connect_aborts_the_dial() {
+        let controller = TestController::start(TestDecision::Allow).await;
+        let mut socks = StalledSocks5Server::start();
+        let guest_dst: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let (proxy, proxy_connect, _to_guest) = controlled_tls_proxy(
+            guest_dst,
+            tls_state(vec!["api.example.com".to_string()]),
+            &controller,
+            Some(Arc::new(socks.proxy.clone())),
+            synthetic_client_hello("api.example.com"),
+        );
+        let run = tokio::spawn(proxy.try_run());
+
+        controller.wait_for_operations(1).await;
+        socks.wait_for_greeting().await;
+        controller.revoke_all().await;
+
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("revocation must end the proxy task")
+            .unwrap()
+            .unwrap();
+        assert_eq!(proxy_connect.status(), ProxyConnectStatus::PolicyDenied);
+        assert!(socks.was_contacted().await);
+    }
 }

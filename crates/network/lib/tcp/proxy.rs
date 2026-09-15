@@ -20,6 +20,11 @@ use super::connection::ProxyConnectState;
 #[cfg(test)]
 use super::connection::ProxyConnectStatus;
 use super::upstream::UpstreamTcpTarget;
+use crate::control::{
+    NetworkControlClient, NetworkGrant, NetworkOperation, TransportProtocol, unless_revoked,
+    wait_for_revocation,
+};
+use crate::netstack::poll::is_host_destined;
 use crate::netstack::shared::SharedState;
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::proxy::ResolvedOutboundProxy;
@@ -79,6 +84,8 @@ pub(crate) struct TcpProxy {
     strict: bool,
     proxy_connect: Arc<ProxyConnectState>,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
+    /// Host controller that must authorize the flow before any host socket opens.
+    controller: Option<NetworkControlClient>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -158,7 +165,14 @@ impl TcpProxy {
             strict,
             proxy_connect,
             outbound_proxy,
+            controller: None,
         }
+    }
+
+    /// Require fail-closed host authorization for this connection.
+    pub(crate) fn with_controller(mut self, controller: Option<NetworkControlClient>) -> Self {
+        self.controller = controller;
+        self
     }
 
     /// Run the TCP proxy task to completion.
@@ -190,6 +204,7 @@ impl TcpProxy {
             strict,
             proxy_connect,
             outbound_proxy,
+            controller,
         } = self;
 
         // Pre-connect peek is only for domain policy: the hostname has to be known
@@ -257,6 +272,34 @@ impl TcpProxy {
             }
         }
 
+        // Controlled networking authorizes the guest's logical destination
+        // before any host socket opens. The same grant covers direct and
+        // SOCKS transport alike: the operator-configured proxy is never the
+        // authorized destination.
+        let mut control_grant = match controller.as_ref() {
+            Some(controller) => {
+                match controller
+                    .authorize(NetworkOperation::Connect {
+                        source: None,
+                        destination: guest_dst,
+                        transport: TransportProtocol::Tcp,
+                        hostname: sni.clone(),
+                        destination_is_host: is_host_destined(guest_dst, connect_target.primary()),
+                    })
+                    .await
+                {
+                    Ok(grant) => Some(grant),
+                    Err(error) => {
+                        tracing::debug!(dst = %guest_dst, %error, "TCP egress denied by host controller");
+                        proxy_connect.mark_policy_denied();
+                        shared.proxy_wake.wake();
+                        return Ok(());
+                    }
+                }
+            }
+            None => None,
+        };
+
         // Peek for HTTP CONNECT before dialing upstream; hand off if detected.
         if let Some(tls_state) = tls_state.clone() {
             if initial_buf.is_empty() {
@@ -277,6 +320,8 @@ impl TcpProxy {
                     proxy_connect,
                     outbound_proxy,
                     None,
+                    controller,
+                    control_grant,
                 )
                 .await;
             }
@@ -286,9 +331,16 @@ impl TcpProxy {
         // server-first protocol (SSH, SMTP, a database) sends nothing until it has
         // seen the server's banner; with the socket already open we can relay that
         // banner while we wait, instead of burning the peek budget pre-connect.
-        let stream = connect_target
-            .connect(&proxy_connect, &shared, outbound_proxy.as_deref())
-            .await?;
+        let stream = tokio::select! {
+            biased;
+            () = wait_for_revocation(&mut control_grant) => {
+                tracing::debug!(dst = %guest_dst, "TCP flow revoked by host controller before connect");
+                proxy_connect.mark_policy_denied();
+                shared.proxy_wake.wake();
+                return Ok(());
+            }
+            result = connect_target.connect(&proxy_connect, &shared, outbound_proxy.as_deref()) => result?,
+        };
         let connect_dst = stream.peer_addr().unwrap_or(connect_target.primary());
         let (mut server_rx, mut server_tx) = stream.into_split();
 
@@ -302,17 +354,23 @@ impl TcpProxy {
             || secrets.has_plain_http_candidates()
             || secrets.has_host_scoped_secrets();
         let (initial_buf, is_tls) = if want_headers {
-            classify_first_flight(
-                initial_buf,
-                &mut from_smoltcp,
-                &mut server_rx,
-                &to_smoltcp,
-                &shared,
-                want_headers,
-                PEEK_BUF_SIZE,
-                PEEK_BUDGET,
-            )
-            .await?
+            tokio::select! {
+                biased;
+                () = wait_for_revocation(&mut control_grant) => {
+                    tracing::debug!(dst = %guest_dst, "TCP flow revoked by host controller during classification");
+                    return Ok(());
+                }
+                result = classify_first_flight(
+                    initial_buf,
+                    &mut from_smoltcp,
+                    &mut server_rx,
+                    &to_smoltcp,
+                    &shared,
+                    want_headers,
+                    PEEK_BUF_SIZE,
+                    PEEK_BUDGET,
+                ) => result?,
+            }
         } else {
             (initial_buf, false)
         };
@@ -340,6 +398,8 @@ impl TcpProxy {
                 proxy_connect,
                 outbound_proxy,
                 Some(proxy_stream),
+                controller,
+                control_grant,
             )
             .await;
         }
@@ -385,13 +445,22 @@ impl TcpProxy {
                 None => Cow::Borrowed(&initial_buf),
             };
             if !out.is_empty() {
-                if let Err(e) = server_tx.write_all(&out).await {
-                    tracing::debug!(dst = %connect_dst, error = %e, "replay of buffered first flight failed");
-                    return Ok(());
-                }
-                if let Err(e) = server_tx.flush().await {
-                    tracing::debug!(dst = %connect_dst, error = %e, "flush after first flight failed");
-                    return Ok(());
+                let replay = async {
+                    server_tx.write_all(&out).await?;
+                    server_tx.flush().await
+                };
+                tokio::select! {
+                    biased;
+                    () = wait_for_revocation(&mut control_grant) => {
+                        tracing::debug!(dst = %guest_dst, "TCP flow revoked by host controller during first flight");
+                        return Ok(());
+                    }
+                    result = replay => {
+                        if let Err(e) = result {
+                            tracing::debug!(dst = %connect_dst, error = %e, "replay of buffered first flight failed");
+                            return Ok(());
+                        }
+                    }
                 }
             }
         }
@@ -405,6 +474,10 @@ impl TcpProxy {
         let mut guest_eof = false;
         loop {
             tokio::select! {
+                () = wait_for_revocation(&mut control_grant) => {
+                    tracing::debug!(dst = %guest_dst, "TCP flow revoked by host controller");
+                    break;
+                }
                 // Guest → server: substitute placeholders before forwarding.
                 data = from_smoltcp.recv(), if !guest_eof => {
                     match data {
@@ -432,6 +505,8 @@ impl TcpProxy {
                                     proxy_connect,
                                     outbound_proxy,
                                     Some(proxy_stream),
+                                    controller,
+                                    control_grant,
                                 )
                                 .await;
                             }
@@ -590,6 +665,8 @@ async fn handle_connect_tunnel(
     proxy_connect: Arc<ProxyConnectState>,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
     preconnected_proxy: Option<TcpStream>,
+    controller: Option<NetworkControlClient>,
+    mut control_grant: Option<NetworkGrant>,
 ) -> io::Result<()> {
     let proxy_dst = proxy_target.primary();
     let connect_req =
@@ -612,11 +689,16 @@ async fn handle_connect_tunnel(
     // Dial the proxy and forward the CONNECT request so it opens the tunnel.
     let mut proxy_stream = match preconnected_proxy {
         Some(stream) => stream,
-        None => {
-            proxy_target
-                .connect(&proxy_connect, &shared, outbound_proxy.as_deref())
-                .await?
-        }
+        None => tokio::select! {
+            biased;
+            () = wait_for_revocation(&mut control_grant) => {
+                tracing::debug!(dst = %proxy_dst, "CONNECT flow revoked by host controller before connect");
+                proxy_connect.mark_policy_denied();
+                shared.proxy_wake.wake();
+                return Ok(());
+            }
+            result = proxy_target.connect(&proxy_connect, &shared, outbound_proxy.as_deref()) => result?,
+        },
     };
 
     if !connect_req.target.is_intercepted(&tls_state) {
@@ -639,9 +721,17 @@ async fn handle_connect_tunnel(
             shared.proxy_wake.wake();
             return Ok(());
         }
-        proxy_stream.write_all(&connect_headers).await?;
-        proxy_stream.flush().await?;
-        let (proxy_resp, header_end) = read_connect_response_headers(&mut proxy_stream).await?;
+        // The header exchange opens the external tunnel, so it runs under the
+        // transport grant like a dial would, on the preconnected path too.
+        let Some(exchanged) = unless_revoked(
+            &mut control_grant,
+            exchange_connect_headers(&mut proxy_stream, &connect_headers),
+        )
+        .await
+        else {
+            return connect_revoked(proxy_dst, &proxy_connect, &shared);
+        };
+        let (proxy_resp, header_end) = exchanged?;
         if to_smoltcp
             .send(Bytes::copy_from_slice(&proxy_resp[..header_end]))
             .await
@@ -663,19 +753,38 @@ async fn handle_connect_tunnel(
             return Ok(());
         }
         if !connect_req.post_header_bytes().is_empty() {
-            proxy_stream
-                .write_all(connect_req.post_header_bytes())
-                .await?;
+            let Some(written) = unless_revoked(&mut control_grant, async {
+                proxy_stream
+                    .write_all(connect_req.post_header_bytes())
+                    .await?;
+                proxy_stream.flush().await
+            })
+            .await
+            else {
+                return connect_revoked(proxy_dst, &proxy_connect, &shared);
+            };
+            written?;
         }
-        proxy_stream.flush().await?;
         proxy_connect.mark_connected();
-        return relay_connected_stream(proxy_stream, from_smoltcp, to_smoltcp, shared).await;
+        return relay_connected_stream(
+            proxy_stream,
+            from_smoltcp,
+            to_smoltcp,
+            shared,
+            control_grant,
+        )
+        .await;
     }
 
-    proxy_stream.write_all(&connect_headers).await?;
-    proxy_stream.flush().await?;
-
-    let (proxy_resp, header_end) = read_connect_response_headers(&mut proxy_stream).await?;
+    let Some(exchanged) = unless_revoked(
+        &mut control_grant,
+        exchange_connect_headers(&mut proxy_stream, &connect_headers),
+    )
+    .await
+    else {
+        return connect_revoked(proxy_dst, &proxy_connect, &shared);
+    };
+    let (proxy_resp, header_end) = exchanged?;
     if !connect_response_is_success(&proxy_resp[..header_end]) {
         return Err(io::Error::new(
             io::ErrorKind::ConnectionRefused,
@@ -721,8 +830,32 @@ async fn handle_connect_tunnel(
     .with_upstream(proxy_stream)
     .with_expected_sni(expected_sni)
     .with_initial_buf(tls_seed)
+    .with_controller(controller)
+    .with_control_grant(control_grant)
     .try_run()
     .await
+}
+
+/// Write the sanitized CONNECT request and read the proxy's response headers.
+async fn exchange_connect_headers(
+    proxy_stream: &mut TcpStream,
+    connect_headers: &[u8],
+) -> io::Result<(Vec<u8>, usize)> {
+    proxy_stream.write_all(connect_headers).await?;
+    proxy_stream.flush().await?;
+    read_connect_response_headers(proxy_stream).await
+}
+
+/// Finish a CONNECT flow whose transport grant was revoked before the tunnel opened.
+fn connect_revoked(
+    proxy_dst: SocketAddr,
+    proxy_connect: &ProxyConnectState,
+    shared: &SharedState,
+) -> io::Result<()> {
+    tracing::debug!(dst = %proxy_dst, "CONNECT flow revoked by host controller before the tunnel opened");
+    proxy_connect.mark_policy_denied();
+    shared.proxy_wake.wake();
+    Ok(())
 }
 
 /// Relay an established TCP stream without inspecting or substituting bytes.
@@ -731,6 +864,7 @@ async fn relay_connected_stream(
     mut from_smoltcp: mpsc::Receiver<Bytes>,
     to_smoltcp: mpsc::Sender<Bytes>,
     shared: Arc<SharedState>,
+    mut control_grant: Option<NetworkGrant>,
 ) -> io::Result<()> {
     let (mut server_rx, mut server_tx) = stream.into_split();
     let mut server_buf = vec![0u8; SERVER_READ_BUF_SIZE];
@@ -738,6 +872,10 @@ async fn relay_connected_stream(
     let mut guest_eof = false;
     loop {
         tokio::select! {
+            () = wait_for_revocation(&mut control_grant) => {
+                tracing::debug!("proxied TCP flow revoked by host controller");
+                break;
+            }
             data = from_smoltcp.recv(), if !guest_eof => {
                 match data {
                     Some(bytes) => {
@@ -1176,13 +1314,13 @@ async fn peek_for_sni(
 //--------------------------------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Synthetic TLS ClientHello carrying SNI `example.com`. Bytes
     /// borrowed from `tls::sni` test fixtures so the parser sees a
     /// well-formed record.
-    fn synthetic_client_hello(sni: &str) -> Vec<u8> {
+    pub(crate) fn synthetic_client_hello(sni: &str) -> Vec<u8> {
         // Minimal but valid TLS 1.2 ClientHello with one SNI entry.
         // Layout: record header (5) + handshake header (4) + body.
         let host_bytes = sni.as_bytes();
@@ -1327,6 +1465,8 @@ mod tests {
             proxy_connect.clone(),
             Some(Arc::new(outbound_proxy)),
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1341,6 +1481,271 @@ mod tests {
             proxy_connect.status(),
             ProxyConnectStatus::Connected
         ));
+    }
+
+    /// A SOCKS5 server that accepts one client, reads its greeting and then
+    /// holds the connection open without answering until dropped, so the
+    /// client's dial stays pending for as long as the test needs.
+    pub(crate) struct StalledSocks5Server {
+        pub(crate) proxy: ResolvedOutboundProxy,
+        greeted: tokio::sync::watch::Receiver<bool>,
+        release: Option<tokio::sync::oneshot::Sender<()>>,
+        task: Option<tokio::task::JoinHandle<bool>>,
+    }
+
+    impl StalledSocks5Server {
+        pub(crate) fn start() -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let proxy = ResolvedOutboundProxy::Socks5 {
+                address: listener.local_addr().unwrap(),
+                credentials: None,
+            };
+            let (greeted_tx, greeted) = tokio::sync::watch::channel(false);
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let task = tokio::spawn(async move {
+                let mut release_rx = release_rx;
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => accepted.ok(),
+                    _ = &mut release_rx => None,
+                };
+                let Some((mut client, _)) = accepted else {
+                    return false;
+                };
+                let mut greeting = [0u8; 3];
+                if client.read_exact(&mut greeting).await.is_err() {
+                    return false;
+                }
+                let _ = greeted_tx.send(true);
+                // Never answer; keep the connection open until released.
+                let _ = release_rx.await;
+                drop(client);
+                true
+            });
+            Self {
+                proxy,
+                greeted,
+                release: Some(release_tx),
+                task: Some(task),
+            }
+        }
+
+        /// Wait until the client's SOCKS5 greeting arrived, i.e. the dial is
+        /// pending inside the SOCKS handshake.
+        pub(crate) async fn wait_for_greeting(&mut self) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !*self.greeted.borrow() {
+                    self.greeted.changed().await.unwrap();
+                }
+            })
+            .await
+            .expect("the client should reach the SOCKS5 greeting");
+        }
+
+        /// Release the server and report whether any client ever connected.
+        pub(crate) async fn was_contacted(mut self) -> bool {
+            drop(self.release.take());
+            self.task.take().unwrap().await.unwrap()
+        }
+    }
+
+    fn controlled_proxy(
+        guest_dst: SocketAddr,
+        request: &[u8],
+        controller: &crate::control::test_support::TestController,
+        outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
+    ) -> (TcpProxy, Arc<ProxyConnectState>) {
+        let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
+        let (to_tx, _to_rx) = mpsc::channel::<Bytes>(8);
+        from_tx.try_send(Bytes::copy_from_slice(request)).unwrap();
+        // Keep the guest side open so nothing observes an early close.
+        std::mem::forget(from_tx);
+        let proxy_connect = Arc::new(ProxyConnectState::new());
+        let proxy = TcpProxy::new(
+            guest_dst,
+            UpstreamTcpTarget::direct(guest_dst),
+            from_rx,
+            to_tx,
+            Arc::new(SharedState::new(4)),
+            Arc::new(NetworkPolicy::allow_all()),
+            Arc::new(SecretsConfig::default()),
+            None,
+            false,
+            proxy_connect.clone(),
+            outbound_proxy,
+        )
+        .with_controller(Some(controller.client()));
+        (proxy, proxy_connect)
+    }
+
+    #[tokio::test]
+    async fn controlled_tcp_denial_never_opens_a_host_socket() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let controller = TestController::start(TestDecision::Deny).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let guest_dst = listener.local_addr().unwrap();
+        let (proxy, proxy_connect) = controlled_proxy(
+            guest_dst,
+            b"GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+            &controller,
+            None,
+        );
+
+        proxy.try_run().await.unwrap();
+
+        assert_eq!(proxy_connect.status(), ProxyConnectStatus::PolicyDenied);
+        let operations = controller.wait_for_operations(1).await;
+        assert_eq!(operations.len(), 1);
+        assert!(
+            matches!(
+                &operations[0],
+                NetworkOperation::Connect { destination, transport: TransportProtocol::Tcp, hostname: Some(hostname), destination_is_host: false, .. }
+                    if *destination == guest_dst && hostname == "api.example.com"
+            ),
+            "{operations:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "denied flow must not connect"
+        );
+    }
+
+    #[tokio::test]
+    async fn controlled_tcp_over_socks5_authorizes_the_guest_destination() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let controller = TestController::start(TestDecision::Deny).await;
+        let socks = StalledSocks5Server::start();
+        let socks_addr = match &socks.proxy {
+            ResolvedOutboundProxy::Socks5 { address, .. } => *address,
+            _ => unreachable!(),
+        };
+        let guest_dst: SocketAddr = "93.184.216.34:80".parse().unwrap();
+        let (proxy, proxy_connect) = controlled_proxy(
+            guest_dst,
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            &controller,
+            Some(Arc::new(socks.proxy.clone())),
+        );
+
+        proxy.try_run().await.unwrap();
+
+        assert_eq!(proxy_connect.status(), ProxyConnectStatus::PolicyDenied);
+        let operations = controller.wait_for_operations(1).await;
+        assert!(
+            matches!(
+                &operations[0],
+                NetworkOperation::Connect { destination, .. } if *destination == guest_dst
+            ),
+            "authorization must name the guest destination, not the SOCKS server {socks_addr}: {operations:?}"
+        );
+        assert!(
+            !socks.was_contacted().await,
+            "denied flow must not dial the SOCKS server"
+        );
+    }
+
+    #[tokio::test]
+    async fn controlled_tcp_over_socks5_revocation_during_connect_aborts_the_dial() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let controller = TestController::start(TestDecision::Allow).await;
+        let mut socks = StalledSocks5Server::start();
+        let guest_dst: SocketAddr = "93.184.216.34:80".parse().unwrap();
+        let (proxy, proxy_connect) = controlled_proxy(
+            guest_dst,
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            &controller,
+            Some(Arc::new(socks.proxy.clone())),
+        );
+        let run = tokio::spawn(proxy.try_run());
+
+        // The SOCKS handshake is stalled by the server, so the dial is still
+        // pending when the host revokes the flow.
+        controller.wait_for_operations(1).await;
+        socks.wait_for_greeting().await;
+        controller.revoke_all().await;
+
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("revocation must end the proxy task")
+            .unwrap()
+            .unwrap();
+        assert_eq!(proxy_connect.status(), ProxyConnectStatus::PolicyDenied);
+        assert!(socks.was_contacted().await);
+    }
+
+    #[tokio::test]
+    async fn controlled_connect_revoked_after_preconnect_forwards_nothing() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let controller = TestController::start(TestDecision::Allow).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let preconnected = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let (mut accepted, _) = listener.accept().await.unwrap();
+
+        // Transport grant obtained by the caller, then revoked before the CONNECT
+        // headers go out. The CONNECT target authorization itself is allowed.
+        let mut control_grant = Some(
+            controller
+                .client()
+                .authorize(NetworkOperation::Connect {
+                    source: None,
+                    destination: proxy_addr,
+                    transport: TransportProtocol::Tcp,
+                    hostname: None,
+                    destination_is_host: false,
+                })
+                .await
+                .unwrap(),
+        );
+        controller.revoke_all().await;
+        control_grant.as_mut().unwrap().revoked().await;
+
+        let (from_tx, from_rx) = mpsc::channel(1);
+        let (to_tx, _to_rx) = mpsc::channel(1);
+        drop(from_tx);
+        let tls_state = Arc::new(
+            TlsState::new(
+                microsandbox_types::TlsConfig::default(),
+                crate::secrets::handle::SecretsHandle::new(SecretsConfig::default()),
+            )
+            .unwrap(),
+        );
+        let proxy_connect = Arc::new(ProxyConnectState::new());
+
+        handle_connect_tunnel(
+            proxy_addr,
+            UpstreamTcpTarget::direct(proxy_addr),
+            b"CONNECT example.com:80 HTTP/1.1\r\nHost: example.com:80\r\n\r\n".to_vec(),
+            from_rx,
+            to_tx,
+            Arc::new(SharedState::new(4)),
+            Arc::new(NetworkPolicy::allow_all()),
+            tls_state,
+            false,
+            proxy_connect.clone(),
+            None,
+            Some(preconnected),
+            Some(controller.client()),
+            control_grant,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(proxy_connect.status(), ProxyConnectStatus::PolicyDenied);
+        let mut buf = [0u8; 64];
+        let read = tokio::time::timeout(Duration::from_millis(200), accepted.read(&mut buf)).await;
+        assert!(
+            matches!(read, Ok(Ok(0)) | Err(_)),
+            "no CONNECT bytes may reach the proxy after revocation: {read:?}"
+        );
     }
 
     #[test]

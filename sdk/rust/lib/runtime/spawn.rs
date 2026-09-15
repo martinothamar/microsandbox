@@ -2857,6 +2857,11 @@ fn sandbox_cli_args(
     {
         launch.network = Some(resolved_network);
         launch.sandbox_slot = network_slot.get();
+        // The marker is a visible flag so an older runtime that does not know
+        // it refuses to start instead of running uncontrolled.
+        if local.network_controlled(&config.spec.name) {
+            visible.push("--network-controlled".into());
+        }
     }
 
     (visible, launch)
@@ -3500,6 +3505,45 @@ mod tests {
         let args = render_args(&config);
 
         assert!(args.iter().any(|arg| arg == "--debug"));
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn controlled_networking_uses_a_fail_closed_cli_marker() {
+        let config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .build()
+            .await
+            .unwrap();
+        let local = test_local_backend();
+        assert!(
+            !render_args(&config)
+                .iter()
+                .any(|arg| arg == "--network-controlled")
+        );
+
+        local.set_network_controlled("test", true);
+        let (visible, _) = sandbox_cli_args(
+            &local,
+            &config,
+            42,
+            test_network_slot(),
+            test_resolved_network(&config),
+            Path::new("/tmp/msb.db"),
+            30,
+            Path::new("/tmp/logs"),
+            Path::new("/tmp/runtime"),
+            Path::new("/tmp/agent.sock"),
+            Path::new("/tmp/libkrunfw.dylib"),
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(visible.contains(&OsString::from("--network-controlled")));
     }
 
     #[tokio::test]

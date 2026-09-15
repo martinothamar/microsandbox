@@ -24,8 +24,12 @@ use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
+use crate::control::{
+    NetworkControlClient, NetworkGrant, NetworkOperation, TransportProtocol, wait_for_revocation,
+};
 use crate::dns::forwarder::DnsForwarderHandle;
 use crate::icmp::error::{construct_packet_too_big, ethernet_ip_payload};
+use crate::netstack::poll::is_host_destined;
 use crate::netstack::shared::SharedState;
 use crate::proxy::ResolvedOutboundProxy;
 
@@ -102,6 +106,7 @@ pub struct UdpRelay {
     tokio_handle: tokio::runtime::Handle,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
     dns_forwarder: Option<DnsForwarderHandle>,
+    controller: Option<NetworkControlClient>,
 }
 
 /// Upstream transport selected for a UDP relay session.
@@ -151,6 +156,7 @@ impl UdpRelay {
     /// * `mtu` - Guest IP-level MTU. Large UDP replies are fragmented to fit it.
     /// * `tokio_handle` - Runtime the per-session relay tasks are spawned on.
     /// * `outbound_proxy` - Optional proxy used for external UDP sessions.
+    /// * `controller` - Optional fail-closed host authorization for every session.
     pub fn new(
         shared: Arc<SharedState>,
         gateway_mac: [u8; 6],
@@ -158,6 +164,7 @@ impl UdpRelay {
         mtu: usize,
         tokio_handle: tokio::runtime::Handle,
         outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
+        controller: Option<NetworkControlClient>,
     ) -> Self {
         Self {
             shared,
@@ -168,6 +175,7 @@ impl UdpRelay {
             tokio_handle,
             outbound_proxy,
             dns_forwarder: None,
+            controller,
         }
     }
 
@@ -319,8 +327,33 @@ impl UdpRelay {
         let guest_mac = self.guest_mac;
         let mtu = self.mtu;
         let dns_forwarder = self.dns_forwarder.clone();
+        let controller = self.controller.clone();
         let task_queued_bytes = queued_bytes.clone();
         self.tokio_handle.spawn(async move {
+            // Authorize the guest's logical destination once, before either
+            // transport opens a host socket; the same revocable grant covers
+            // the whole direct or SOCKS5 session.
+            let control_grant = match controller {
+                Some(controller) => {
+                    match controller
+                        .authorize(NetworkOperation::Connect {
+                            source: Some(guest_src),
+                            destination: guest_dst,
+                            transport: TransportProtocol::Udp,
+                            hostname: None,
+                            destination_is_host: is_host_destined(guest_dst, host_dst),
+                        })
+                        .await
+                    {
+                        Ok(grant) => Some(grant),
+                        Err(error) => {
+                            tracing::debug!(dst = %guest_dst, %error, "UDP egress denied by host controller");
+                            return;
+                        }
+                    }
+                }
+                None => None,
+            };
             let result = match upstream {
                 UdpUpstream::Socks5(outbound_proxy) => {
                     Self::relay_socks5_session(
@@ -335,6 +368,7 @@ impl UdpRelay {
                         mtu,
                         outbound_proxy,
                         dns_forwarder,
+                        control_grant,
                     )
                     .await
                 }
@@ -349,6 +383,7 @@ impl UdpRelay {
                         gateway_mac,
                         guest_mac,
                         mtu,
+                        control_grant,
                     )
                     .await
                 }
@@ -471,6 +506,7 @@ impl UdpRelay {
         gateway_mac: EthernetAddress,
         guest_mac: EthernetAddress,
         mtu: usize,
+        mut control_grant: Option<NetworkGrant>,
     ) -> std::io::Result<()> {
         let socket = open_udp_socket(host_dst)?;
         // Connect to the destination to restrict accepted source addresses,
@@ -483,6 +519,10 @@ impl UdpRelay {
 
         loop {
             tokio::select! {
+                () = wait_for_revocation(&mut control_grant) => {
+                    tracing::debug!(dst = %guest_dst, "UDP flow revoked by host controller");
+                    break;
+                }
                 // Outbound: guest → server.
                 data = outbound_rx.recv() => {
                     match data {
@@ -606,12 +646,26 @@ impl UdpRelay {
         mtu: usize,
         outbound_proxy: Arc<ResolvedOutboundProxy>,
         dns_forwarder: Option<DnsForwarderHandle>,
+        mut control_grant: Option<NetworkGrant>,
     ) -> io::Result<()> {
-        let association = outbound_proxy.associate_udp(dns_forwarder).await?;
+        // The SOCKS5 association opens the host-side control connection, so it
+        // races revocation like a direct connect would.
+        let association = tokio::select! {
+            biased;
+            () = wait_for_revocation(&mut control_grant) => {
+                tracing::debug!(dst = %guest_dst, "UDP flow revoked by host controller before SOCKS5 association");
+                return Ok(());
+            }
+            result = outbound_proxy.associate_udp(dns_forwarder) => result?,
+        };
         let mut recv_buf = vec![0u8; RECV_BUF_SIZE];
 
         loop {
             tokio::select! {
+                () = wait_for_revocation(&mut control_grant) => {
+                    tracing::debug!(dst = %guest_dst, "UDP flow revoked by host controller");
+                    break;
+                }
                 data = outbound_rx.recv() => {
                     match data {
                         Some(datagram) => {
@@ -1531,6 +1585,120 @@ fn cmsg_align(len: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::control::test_support::{TestController, TestDecision};
+    use crate::control::{NetworkOperation, TransportProtocol};
+
+    fn controlled_relay(
+        controller: &TestController,
+        outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
+    ) -> UdpRelay {
+        UdpRelay::new(
+            Arc::new(SharedState::new(4)),
+            [0x02, 0, 0, 0, 0, 1],
+            [0x02, 0, 0, 0, 0, 2],
+            1500,
+            tokio::runtime::Handle::current(),
+            outbound_proxy,
+            Some(controller.client()),
+        )
+    }
+
+    fn datagram(payload: &[u8]) -> OutboundDatagram {
+        OutboundDatagram {
+            payload: Bytes::copy_from_slice(payload),
+            original_ip_packet: Bytes::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn controlled_udp_denial_never_sends_a_datagram() {
+        let controller = TestController::start(TestDecision::Deny).await;
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let guest_dst = server.local_addr().unwrap();
+        let guest_src: SocketAddr = "10.0.0.2:40000".parse().unwrap();
+        let relay = controlled_relay(&controller, None);
+
+        let session = relay
+            .create_session(guest_src, guest_dst, guest_dst)
+            .expect("direct sessions are always created");
+        session.outbound_tx.send(datagram(b"hello")).await.unwrap();
+
+        let operations = controller.wait_for_operations(1).await;
+        assert!(
+            matches!(
+                &operations[0],
+                NetworkOperation::Connect { source: Some(source), destination, transport: TransportProtocol::Udp, .. }
+                    if *source == guest_src && *destination == guest_dst
+            ),
+            "{operations:?}"
+        );
+        let mut buf = [0u8; 64];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), server.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "denied session must not send"
+        );
+    }
+
+    #[tokio::test]
+    async fn controlled_udp_over_socks5_authorizes_the_guest_destination() {
+        let controller = TestController::start(TestDecision::Deny).await;
+        let socks = crate::tcp::proxy::tests::StalledSocks5Server::start();
+        let guest_dst: SocketAddr = "93.184.216.34:53".parse().unwrap();
+        let guest_src: SocketAddr = "10.0.0.2:40000".parse().unwrap();
+        let relay = controlled_relay(&controller, Some(Arc::new(socks.proxy.clone())));
+
+        let session = relay
+            .create_session(guest_src, guest_dst, guest_dst)
+            .expect("SOCKS5 sessions are created");
+        session.outbound_tx.send(datagram(b"hello")).await.unwrap();
+
+        let operations = controller.wait_for_operations(1).await;
+        assert!(
+            matches!(
+                &operations[0],
+                NetworkOperation::Connect { destination, transport: TransportProtocol::Udp, .. }
+                    if *destination == guest_dst
+            ),
+            "authorization must name the guest destination, not the SOCKS server: {operations:?}"
+        );
+        // A denied session ends immediately, which closes its outbound receiver.
+        tokio::time::timeout(Duration::from_secs(5), session.outbound_tx.closed())
+            .await
+            .expect("a denied session must end");
+        assert!(
+            !socks.was_contacted().await,
+            "a denied session must not open the SOCKS5 control connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn controlled_udp_over_socks5_revocation_during_association_aborts_the_session() {
+        let controller = TestController::start(TestDecision::Allow).await;
+        let mut socks = crate::tcp::proxy::tests::StalledSocks5Server::start();
+        let guest_dst: SocketAddr = "93.184.216.34:53".parse().unwrap();
+        let guest_src: SocketAddr = "10.0.0.2:40000".parse().unwrap();
+        let relay = controlled_relay(&controller, Some(Arc::new(socks.proxy.clone())));
+
+        let session = relay
+            .create_session(guest_src, guest_dst, guest_dst)
+            .expect("SOCKS5 sessions are created");
+        session.outbound_tx.send(datagram(b"hello")).await.unwrap();
+
+        // The SOCKS5 greeting is never answered, so the association is still
+        // pending when the host revokes the flow.
+        controller.wait_for_operations(1).await;
+        socks.wait_for_greeting().await;
+        controller.revoke_all().await;
+
+        // A revoked session drops its outbound receiver, which the sender observes.
+        tokio::time::timeout(Duration::from_secs(5), session.outbound_tx.closed())
+            .await
+            .expect("revocation must end the relay session");
+        assert!(socks.was_contacted().await);
+    }
 
     #[test]
     fn construct_v4_response_has_correct_structure() {

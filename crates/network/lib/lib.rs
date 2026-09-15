@@ -15,6 +15,7 @@ mod addr;
 pub mod proxy;
 
 pub mod config;
+pub mod control;
 pub mod dns;
 pub mod icmp;
 pub mod netstack;

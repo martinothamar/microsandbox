@@ -21,7 +21,7 @@ use std::{
     collections::{HashMap, HashSet},
     num::NonZero,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 #[cfg(unix)]
@@ -60,6 +60,9 @@ pub struct LocalBackend {
     db: OnceCell<DbPools>,
     selection_source: BackendSelectionSource,
     profile: Option<String>,
+    /// Sandboxes whose runtime must authorize every outbound operation with
+    /// the host controller bound through [`Self::bind_network_controller`].
+    network_controlled_sandboxes: RwLock<HashSet<String>>,
 }
 
 /// Fluent builder for [`LocalBackend`]. Construct via [`LocalBackend::builder`].
@@ -137,6 +140,7 @@ impl LocalBackend {
             db: OnceCell::new(),
             selection_source,
             profile,
+            network_controlled_sandboxes: RwLock::new(HashSet::new()),
         }
     }
 
@@ -218,6 +222,55 @@ impl LocalBackend {
     /// Resolved ephemeral runtime directory.
     pub fn run_dir(&self) -> PathBuf {
         self.config.run_dir()
+    }
+
+    /// Enables or disables host-controlled networking for a local Sandbox.
+    ///
+    /// This is a local embedding hook. The caller must bind the controller
+    /// returned by [`Self::bind_network_controller`] before starting the
+    /// Sandbox. A selected controller that is absent or unresponsive causes
+    /// outbound operations to fail closed.
+    #[cfg(feature = "net")]
+    pub fn set_network_controlled(&self, name: impl Into<String>, enabled: bool) {
+        let name = name.into();
+        let mut sandboxes = self
+            .network_controlled_sandboxes
+            .write()
+            .expect("Network control configuration lock poisoned");
+        if enabled {
+            sandboxes.insert(name);
+        } else {
+            sandboxes.remove(&name);
+        }
+    }
+
+    /// Binds the local controller endpoint for one selected Sandbox.
+    ///
+    /// The returned value owns platform-specific IPC, bounded framing,
+    /// reconnection and endpoint cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the local endpoint cannot be bound safely.
+    #[cfg(feature = "net")]
+    pub async fn bind_network_controller(
+        &self,
+        name: &str,
+    ) -> crate::MicrosandboxResult<microsandbox_network::control::NetworkControlHost> {
+        let agent =
+            microsandbox_runtime::ipc::canonical_agent_endpoint(&self.config.run_dir(), name);
+        let endpoint = microsandbox_runtime::ipc::network_control_endpoint_for(&agent);
+        microsandbox_network::control::NetworkControlHost::bind(endpoint)
+            .await
+            .map_err(Into::into)
+    }
+
+    #[cfg(feature = "net")]
+    pub(crate) fn network_controlled(&self, name: &str) -> bool {
+        self.network_controlled_sandboxes
+            .read()
+            .expect("Network control configuration lock poisoned")
+            .contains(name)
     }
 
     /// Warn about create-time options only a cloud backend can honor.
@@ -474,6 +527,7 @@ impl LocalBackendBuilder {
             db: OnceCell::new(),
             selection_source: BackendSelectionSource::Programmatic,
             profile: None,
+            network_controlled_sandboxes: RwLock::new(HashSet::new()),
         }
     }
 
@@ -895,6 +949,7 @@ mod tests {
             db: OnceCell::new(),
             selection_source: BackendSelectionSource::Programmatic,
             profile: None,
+            network_controlled_sandboxes: RwLock::new(HashSet::new()),
         };
 
         let (inherited, overridden) = with_backend(backend, async {
@@ -958,6 +1013,7 @@ mod tests {
             db: OnceCell::new(),
             selection_source: BackendSelectionSource::Programmatic,
             profile: None,
+            network_controlled_sandboxes: RwLock::new(HashSet::new()),
         };
         let mut config = SandboxConfig::default();
         config.spec.name = "profile-test".into();
@@ -978,6 +1034,7 @@ mod tests {
             db: OnceCell::new(),
             selection_source: BackendSelectionSource::Programmatic,
             profile: None,
+            network_controlled_sandboxes: RwLock::new(HashSet::new()),
         };
         let mut config = SandboxConfig::default();
         config.spec.deployment_profile = DeploymentProfile::MultiTenant;
