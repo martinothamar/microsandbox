@@ -827,8 +827,25 @@ fn enable_windows_hypervisor_platform() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Refuse self-management in the Digdir downstream build.
+///
+/// The downstream runtime is installed and pinned by the application that
+/// embeds it, and the upstream self-management commands would query and
+/// install upstream releases in its place.
+fn refuse_self_management(operation: &str) -> anyhow::Result<()> {
+    refuse_static(
+        &format!("`msb self {operation}` is not available in this runtime"),
+        &[
+            "this Microsandbox runtime is managed by the application that embeds it and does not update itself",
+            "upgrade the embedding application to move to another runtime version",
+        ],
+    )
+}
+
 /// Update msb and libkrunfw to the latest release.
 pub async fn run_update(args: SelfUpdateArgs) -> anyhow::Result<()> {
+    refuse_self_management("update")?;
+
     info(&format!("Current version: v{CURRENT_VERSION}"));
 
     let spinner = ui::Spinner::start("Checking", "latest release");
@@ -919,6 +936,8 @@ async fn install_update_release(
 
 /// Downgrade msb and local state to an older supported release.
 pub async fn run_downgrade(args: SelfDowngradeArgs) -> anyhow::Result<()> {
+    refuse_self_management("downgrade")?;
+
     run_downgrade_local(args).await
 }
 
