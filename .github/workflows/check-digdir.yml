@@ -1,0 +1,466 @@
+name: Check Digdir
+
+# This fork consumes the Rust SDK and its bundled runtime. Language-package
+# matrices and hardware-virtualization tests remain outside downstream CI.
+
+on:
+  push:
+    branches: [main-digdir]
+  pull_request:
+    branches: [main-digdir]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main-digdir' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_TIMEOUT: "120"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_INCREMENTAL: "0"
+  LIBKRUNFW_VERSION: "5.6.1"
+  LIBKRUNFW_ABI: "5"
+
+jobs:
+  validate:
+    name: Validate downstream source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Checkout libkrunfw sources
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+
+      - name: Validate downstream version and firmware source
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          case "${version}" in
+            *-digdir.*) ;;
+            *)
+              echo "::error::workspace version must contain the -digdir.N prerelease suffix"
+              exit 1
+              ;;
+          esac
+
+          expected_remote=https://github.com/martinothamar/libkrunfw.git
+          actual_remote=$(git config --file .gitmodules --get submodule.vendor/libkrunfw.url)
+          if [ "${actual_remote}" != "${expected_remote}" ]; then
+            echo "::error::libkrunfw submodule uses ${actual_remote}, expected ${expected_remote}"
+            exit 1
+          fi
+
+          status=$(git submodule status vendor/libkrunfw)
+          case "${status}" in
+            [-+]*)
+              echo "::error::libkrunfw submodule is not at its committed revision: ${status}"
+              exit 1
+              ;;
+          esac
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Check the locked dependency graph
+        run: cargo metadata --locked --no-deps --format-version 1 >/dev/null
+
+      - name: Validate release artifact checks
+        run: python3 -m unittest scripts.ci.test_validate_linux_glibc scripts.ci.test_validate_release_artifacts
+
+  build-kernel:
+    name: Build guest kernel (${{ matrix.arch }})
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Checkout libkrunfw sources
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+
+      - name: Install kernel build dependencies
+        run: sudo apt-get update && sudo apt-get install -y bc bison flex gcc libelf-dev make python3-pyelftools
+
+      - name: Prepare kernel source
+        uses: ./.github/actions/cache-libkrunfw-kernel
+
+      - name: Build kernel firmware bundle
+        working-directory: vendor/libkrunfw
+        run: make -j"$(nproc)" kernel.c
+
+      - name: Upload kernel firmware bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digdir-kernel-${{ matrix.arch }}
+          path: vendor/libkrunfw/kernel.c
+          compression-level: 0
+
+  build-agentd:
+    name: Build guest agent (${{ matrix.arch }})
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          cache-targets: true
+          shared-key: digdir-agentd-${{ matrix.arch }}
+
+      - name: Install musl build dependencies
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build agentd
+        run: |
+          cargo +stable build --locked --profile ci --manifest-path crates/agentd/Cargo.toml --target ${{ matrix.target }}
+          mkdir -p build
+          cp target/${{ matrix.target }}/ci/agentd build/agentd
+
+      - name: Upload guest agent
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digdir-agentd-${{ matrix.arch }}
+          path: build/agentd
+          compression-level: 0
+
+  build-linux:
+    name: Build runtime (${{ matrix.target }})
+    needs: [validate, build-kernel, build-agentd]
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ${{ matrix.manylinux_image }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runner: ubuntu-latest
+            arch: x86_64
+            manylinux_image: quay.io/pypa/manylinux_2_28_x86_64@sha256:0c87ccb5996dab6c3b7612ee4fda7b80c4ab3c44a86c2541e4a872afdf4f131b
+            libkrunfw_file: libkrunfw.so.5.6.1
+          - target: linux-aarch64
+            runner: ubuntu-24.04-arm
+            arch: aarch64
+            manylinux_image: quay.io/pypa/manylinux_2_28_aarch64@sha256:561427136aabf3787bffb294b3515748241e0962d1527ae28bea1e076bfb9d99
+            libkrunfw_file: libkrunfw.so.5.6.1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          cache-targets: true
+          shared-key: digdir-runtime-${{ matrix.target }}
+
+      - name: Install build dependencies
+        run: dnf install -y libcap-ng-devel
+
+      - name: Download guest agent
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: digdir-agentd-${{ matrix.arch }}
+          path: build/
+
+      - name: Download kernel firmware bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: digdir-kernel-${{ matrix.arch }}
+          path: firmware/
+
+      - name: Build libkrunfw
+        run: |
+          mkdir -p build
+          cc -fPIC -DABI_VERSION=${{ env.LIBKRUNFW_ABI }} -shared \
+            -Wl,-soname,libkrunfw.so.${{ env.LIBKRUNFW_ABI }} \
+            -o build/${{ matrix.libkrunfw_file }} firmware/kernel.c
+          cd build
+          ln -sf ${{ matrix.libkrunfw_file }} libkrunfw.so.${{ env.LIBKRUNFW_ABI }}
+          ln -sf libkrunfw.so.${{ env.LIBKRUNFW_ABI }} libkrunfw.so
+
+      - name: Build msb
+        run: |
+          cargo +stable build --locked --profile ci --no-default-features --features net,ssh -p microsandbox-cli
+          cp target/ci/msb build/msb
+          build/msb --version
+
+      - name: Upload runtime artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: msb-${{ matrix.target }}
+          path: build/
+          compression-level: 0
+
+  build-macos:
+    name: Build runtime (darwin-aarch64)
+    needs: [validate, build-kernel, build-agentd]
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          cache-targets: true
+          shared-key: digdir-runtime-darwin-aarch64
+
+      - name: Download guest agent
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: digdir-agentd-aarch64
+          path: build/
+
+      - name: Download kernel firmware bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: digdir-kernel-aarch64
+          path: firmware/
+
+      - name: Build libkrunfw
+        run: |
+          mkdir -p build
+          cc -fPIC -DABI_VERSION=${{ env.LIBKRUNFW_ABI }} -shared \
+            -o build/libkrunfw.${{ env.LIBKRUNFW_ABI }}.dylib firmware/kernel.c
+          cd build
+          ln -sf libkrunfw.${{ env.LIBKRUNFW_ABI }}.dylib libkrunfw.dylib
+
+      - name: Build and codesign msb
+        run: |
+          cargo +stable build --locked --profile ci --no-default-features --features net,ssh -p microsandbox-cli
+          cp target/ci/msb build/msb
+          codesign --entitlements msb-entitlements.plist --force -s - build/msb
+          build/msb --version
+
+      - name: Upload runtime artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: msb-darwin-aarch64
+          path: build/
+          compression-level: 0
+
+  rust-quality:
+    name: Rust quality
+    needs: build-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy, rustfmt
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          cache-targets: true
+          shared-key: digdir-rust-quality
+
+      - name: Install build dependencies
+        run: scripts/ci/install-apt-packages.sh musl-tools libcap-ng-dev
+
+      - name: Download runtime artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: msb-linux-x86_64
+          path: build/
+
+      - uses: rui314/setup-mold@7e4f20ad28a2e8ca6fd0892ccf72e2abb706b9c3 # 2.41.0
+
+      - name: Format
+        run: |
+          cargo +stable fmt --all -- --check
+          cargo +stable fmt --manifest-path crates/agentd/Cargo.toml -- --check
+
+      - name: Check agentd
+        run: cargo +stable clippy --locked --manifest-path crates/agentd/Cargo.toml --target x86_64-unknown-linux-musl -- -D warnings
+
+      - name: Clippy
+        run: cargo +stable clippy --locked --workspace --exclude microsandbox-agentd -- -D warnings
+
+      - name: Documentation
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo +stable doc --locked --workspace --exclude microsandbox-agentd --no-deps
+
+      - name: Check generated Microsandbox types
+        run: cargo +stable run --locked -p microsandbox-types --features ts --bin microsandbox-types-generate -- --check
+
+  rust-test:
+    name: Rust test (${{ matrix.target }})
+    needs: [build-linux, build-macos]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runner: ubuntu-latest
+            os: linux
+            agentd_target: x86_64-unknown-linux-musl
+          - target: linux-aarch64
+            runner: ubuntu-24.04-arm
+            os: linux
+            agentd_target: aarch64-unknown-linux-musl
+          - target: darwin-aarch64
+            runner: macos-14
+            os: darwin
+            agentd_target: ""
+    uses: ./.github/workflows/test-platform.yml
+    with:
+      target: ${{ matrix.target }}
+      runner: ${{ matrix.runner }}
+      os: ${{ matrix.os }}
+      agentd_target: ${{ matrix.agentd_target }}
+
+  windows:
+    name: Rust runtime and tests (${{ matrix.target }})
+    needs: [validate, build-kernel, build-agentd]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x86_64
+            runner: windows-latest
+            arch: x86_64
+            rust_target: x86_64-pc-windows-msvc
+            vs_arch: amd64
+            vs_host_arch: amd64
+          - target: windows-aarch64
+            runner: windows-11-arm
+            arch: aarch64
+            rust_target: aarch64-pc-windows-msvc
+            vs_arch: arm64
+            vs_host_arch: arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Checkout libkrunfw sources
+        shell: pwsh
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy
+          targets: ${{ matrix.rust_target }}
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          cache-targets: true
+          shared-key: digdir-windows-${{ matrix.target }}
+
+      - name: Download kernel firmware bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: digdir-kernel-${{ matrix.arch }}
+          path: vendor/libkrunfw/
+
+      - name: Download guest agent
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: digdir-agentd-${{ matrix.arch }}
+          path: build/
+
+      - name: Build libkrunfw
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          & .\vendor\libkrunfw\scripts\build-windows.ps1 `
+            -SkipKernelBundle `
+            -AbiVersion ${{ env.LIBKRUNFW_ABI }} `
+            -Architecture ${{ matrix.vs_arch }} `
+            -HostArchitecture ${{ matrix.vs_host_arch }} `
+            -Output libkrunfw.dll `
+            -ImportLibrary libkrunfw.lib
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          Copy-Item vendor\libkrunfw\libkrunfw.dll build\libkrunfw.dll -Force
+
+      - name: Build msb
+        shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
+          cargo +stable build --locked --profile ci --no-default-features --features net,ssh -p microsandbox-cli --target ${{ matrix.rust_target }}
+          Copy-Item target\${{ matrix.rust_target }}\ci\msb.exe build\msb.exe -Force
+          & build\msb.exe --version
+
+      - name: Check msb
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
+          cargo +stable check --locked --no-default-features --features net,ssh -p microsandbox-cli --target ${{ matrix.rust_target }}
+
+      - name: Clippy msb
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
+          cargo +stable clippy --locked --no-default-features --features net,ssh -p microsandbox-cli --target ${{ matrix.rust_target }} -- -D warnings
+
+      - name: Test bind rootfs backend
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
+          cargo +stable test --locked --no-default-features --features net -p microsandbox-runtime --lib --target ${{ matrix.rust_target }} test_bind_rootfs_backend_exposes_host_file_and_init
+
+      - name: Test bind rootfs patches
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
+          cargo +stable test --locked --no-default-features --features net -p microsandbox --lib --target ${{ matrix.rust_target }} sandbox::patch::tests::bind_patch_
+
+      - name: Test Windows DNS resolver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
+          cargo +stable test --locked -p microsandbox-network --lib --target ${{ matrix.rust_target }} dns::windows_resolver::
