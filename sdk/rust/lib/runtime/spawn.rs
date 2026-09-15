@@ -612,28 +612,30 @@ pub async fn spawn_sandbox(
     }
 
     // Capture stdout for attached startup JSON. Detached mode uses a
-    // dedicated startup fd so stdio can be severed from the launcher.
-    #[cfg(unix)]
+    // dedicated startup fd so stdio can be severed from the launcher; its
+    // stderr goes to `logs/runtime.log` so startup failures stay diagnosable.
+    // Windows always routes stderr there because the runtime process is
+    // created without a console.
+    let route_stderr_to_runtime_log = cfg!(windows) || startup_pipe.is_some();
+    let startup_stderr = if route_stderr_to_runtime_log {
+        match StartupStderr::open(&log_dir) {
+            Ok((runtime_log, startup_stderr)) => {
+                cmd.stderr(Stdio::from(runtime_log));
+                Some(startup_stderr)
+            }
+            Err(err) => {
+                release_metrics_reservation(config, metrics_reservation.as_ref());
+                return Err(err.into());
+            }
+        }
+    } else {
+        cmd.stderr(Stdio::inherit());
+        None
+    };
     if startup_pipe.is_some() {
         cmd.stdout(Stdio::null());
-        cmd.stderr(Stdio::null());
     } else {
         cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::inherit());
-    }
-    #[cfg(windows)]
-    {
-        let runtime_log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_dir.join("runtime.log"))?;
-
-        if startup_pipe.is_some() {
-            cmd.stdout(Stdio::null());
-        } else {
-            cmd.stdout(Stdio::piped());
-        }
-        cmd.stderr(Stdio::from(runtime_log));
     }
 
     ensure_sigchld_handler_uses_alt_stack_before_spawn().await?;
@@ -686,16 +688,25 @@ pub async fn spawn_sandbox(
     {
         Ok(Ok(line)) => line,
         Ok(Err(err)) => {
-            terminate_startup_process(&mut child).await;
+            let status = terminate_startup_process(&mut child).await;
             release_metrics_reservation(config, metrics_reservation.as_ref());
-            return Err(err);
+            return Err(startup_failure(
+                format!("{err} (status: {status:?})"),
+                startup_stderr.as_ref(),
+            )
+            .await);
         }
         Err(_) => {
-            terminate_startup_process(&mut child).await;
+            let status = terminate_startup_process(&mut child).await;
             release_metrics_reservation(config, metrics_reservation.as_ref());
-            return Err(crate::MicrosandboxError::Runtime(
-                "sandbox startup timeout: no JSON received within 30 seconds".into(),
-            ));
+            return Err(startup_failure(
+                format!(
+                    "sandbox startup timeout: no JSON received within 30 seconds \
+                     (status: {status:?})"
+                ),
+                startup_stderr.as_ref(),
+            )
+            .await);
         }
     };
 
@@ -709,20 +720,28 @@ pub async fn spawn_sandbox(
                 exit_status = ?status,
                 "spawn_sandbox: failed to parse startup JSON"
             );
-            return Err(crate::MicrosandboxError::Runtime(format!(
-                "sandbox process exited ({status:?}) before sending startup info \
-                 (line: {line:?}, check stderr above for details)"
-            )));
+            return Err(startup_failure(
+                format!(
+                    "sandbox process exited ({status:?}) before sending startup info \
+                     (line: {line:?})"
+                ),
+                startup_stderr.as_ref(),
+            )
+            .await);
         }
     };
     if startup.pid != _pid {
         let status = terminate_startup_process(&mut child).await;
         release_metrics_reservation(config, metrics_reservation.as_ref());
-        return Err(crate::MicrosandboxError::Runtime(format!(
-            "sandbox startup PID mismatch: spawned pid {_pid}, startup pid {} \
-             (status: {status:?})",
-            startup.pid
-        )));
+        return Err(startup_failure(
+            format!(
+                "sandbox startup PID mismatch: spawned pid {_pid}, startup pid {} \
+                 (status: {status:?})",
+                startup.pid
+            ),
+            startup_stderr.as_ref(),
+        )
+        .await);
     }
 
     tracing::debug!(
@@ -2156,6 +2175,82 @@ async fn terminate_startup_process(
     child.wait().await.ok()
 }
 
+/// Upper bound on the runtime stderr reported with a startup failure.
+const STARTUP_STDERR_TAIL_LIMIT: u64 = 64 * 1024;
+
+/// The runtime's stderr destination during startup.
+///
+/// `logs/runtime.log` is opened append-only and shared by every runtime
+/// generation of the sandbox, so the file length at spawn time marks where
+/// this attempt's output begins. Reporting from that offset keeps an earlier
+/// generation's messages out of the current failure.
+struct StartupStderr {
+    path: PathBuf,
+    start: u64,
+}
+
+impl StartupStderr {
+    /// Open the runtime log for appending and remember where this attempt starts.
+    fn open(log_dir: &Path) -> std::io::Result<(File, Self)> {
+        let path = log_dir.join("runtime.log");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        let start = file.metadata()?.len();
+        Ok((file, Self { path, start }))
+    }
+
+    /// The last [`STARTUP_STDERR_TAIL_LIMIT`] bytes this attempt appended.
+    async fn tail(&self) -> String {
+        let path = self.path.clone();
+        let start = self.start;
+        let read = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+            use std::io::Read as _;
+
+            let mut file = File::open(&path)?;
+            let end = file.metadata()?.len().max(start);
+            let from = end.saturating_sub(STARTUP_STDERR_TAIL_LIMIT).max(start);
+            file.seek(SeekFrom::Start(from))?;
+            let mut bytes = Vec::with_capacity((end - from) as usize);
+            file.take(end - from).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })
+        .await;
+        match read {
+            Ok(Ok(bytes)) => String::from_utf8_lossy(&bytes).trim().to_string(),
+            Ok(Err(error)) => format!("<failed to read {}: {error}>", self.path.display()),
+            Err(error) => format!("<failed to read {}: {error}>", self.path.display()),
+        }
+    }
+}
+
+/// Build a startup failure that carries the runtime's stderr when it was
+/// routed to the runtime log for this attempt.
+async fn startup_failure(
+    message: String,
+    startup_stderr: Option<&StartupStderr>,
+) -> crate::MicrosandboxError {
+    let message = match startup_stderr {
+        Some(stderr) => {
+            let tail = stderr.tail().await;
+            if tail.is_empty() {
+                format!(
+                    "{message}; runtime stderr ({}) is empty",
+                    stderr.path.display()
+                )
+            } else {
+                format!(
+                    "{message}; runtime stderr ({}): {tail}",
+                    stderr.path.display()
+                )
+            }
+        }
+        None => format!("{message}; check stderr above for details"),
+    };
+    crate::MicrosandboxError::Runtime(message)
+}
+
 /// Resolve bind mounts whose host source is a regular file.
 ///
 /// The runtime opens the source directly through `SingleFileFs`; this map only
@@ -2852,6 +2947,45 @@ mod tests {
         },
         volume::VolumeKind,
     };
+
+    #[tokio::test]
+    async fn test_startup_stderr_reports_only_this_attempt() {
+        let directory = tempdir().unwrap();
+        let log_path = directory.path().join("runtime.log");
+        std::fs::write(&log_path, "previous generation failed\n").unwrap();
+
+        let (mut runtime_log, startup_stderr) =
+            super::StartupStderr::open(directory.path()).unwrap();
+        assert!(startup_stderr.tail().await.is_empty());
+
+        std::io::Write::write_all(&mut runtime_log, b"kvm: permission denied\n").unwrap();
+        drop(runtime_log);
+
+        assert_eq!(startup_stderr.tail().await, "kvm: permission denied");
+        let error = super::startup_failure("startup timed out".to_string(), Some(&startup_stderr))
+            .await
+            .to_string();
+        assert!(error.contains("startup timed out"), "{error}");
+        assert!(error.contains("kvm: permission denied"), "{error}");
+        assert!(!error.contains("previous generation"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_startup_stderr_tail_is_bounded() {
+        let directory = tempdir().unwrap();
+        let (mut runtime_log, startup_stderr) =
+            super::StartupStderr::open(directory.path()).unwrap();
+        let line = "x".repeat(1023) + "\n";
+        for _ in 0..80 {
+            std::io::Write::write_all(&mut runtime_log, line.as_bytes()).unwrap();
+        }
+        std::io::Write::write_all(&mut runtime_log, b"final line").unwrap();
+        drop(runtime_log);
+
+        let tail = startup_stderr.tail().await;
+        assert!(tail.len() <= super::STARTUP_STDERR_TAIL_LIMIT as usize);
+        assert!(tail.ends_with("final line"));
+    }
 
     #[test]
     #[cfg(unix)]
