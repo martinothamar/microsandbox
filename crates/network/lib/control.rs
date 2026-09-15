@@ -457,6 +457,51 @@ impl NetworkControlClient {
         material.ok_or(AuthorizationError::InvalidResponse)
     }
 
+    /// Synchronously authorizes an operation from the native HTTP parser.
+    ///
+    /// The parser is synchronous. Controlled network handlers run on the
+    /// Microsandbox multi-thread Tokio runtime, so `block_in_place` yields the
+    /// worker while the independent controller task performs local IPC.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on denial, invalid response, timeout, transport
+    /// failure, or use from a runtime that cannot yield a blocking section.
+    #[cfg(feature = "engine")]
+    pub(crate) fn authorize_blocking(
+        &self,
+        operation: NetworkOperation,
+    ) -> Result<NetworkGrant, AuthorizationError> {
+        let handle =
+            tokio::runtime::Handle::try_current().map_err(|_| AuthorizationError::Unavailable)?;
+        if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+            return Err(AuthorizationError::Unavailable);
+        }
+        tokio::task::block_in_place(|| handle.block_on(self.authorize(operation)))
+    }
+
+    /// Authorizes one native secret use and returns only its request-scoped material.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the operation is not `secretUse`, authorization
+    /// fails, or the controller omits the required material.
+    #[cfg(feature = "engine")]
+    pub(crate) fn authorize_secret_use_blocking(
+        &self,
+        operation: NetworkOperation,
+    ) -> Result<SecretMaterial, AuthorizationError> {
+        if !matches!(operation, NetworkOperation::SecretUse { .. }) {
+            return Err(AuthorizationError::InvalidResponse);
+        }
+        let handle =
+            tokio::runtime::Handle::try_current().map_err(|_| AuthorizationError::Unavailable)?;
+        if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+            return Err(AuthorizationError::Unavailable);
+        }
+        tokio::task::block_in_place(|| handle.block_on(self.authorize_secret_use(operation)))
+    }
+
     async fn request_authorization(
         &self,
         operation: NetworkOperation,
@@ -1105,10 +1150,13 @@ pub(crate) mod test_support {
     /// How the scripted controller answers every authorization request.
     #[derive(Clone, Copy, Debug)]
     pub(crate) enum TestDecision {
-        /// Allow every operation.
+        /// Allow every operation. A secret use receives the material
+        /// `resolved-<secret>`.
         Allow,
         /// Deny every operation.
         Deny,
+        /// Allow transport operations but deny every HTTP request and secret use.
+        DenyHttpRequests,
     }
 
     /// Host endpoint plus the runtime client connected to it.
@@ -1238,18 +1286,33 @@ pub(crate) mod test_support {
                     flow_id,
                     operation,
                 } => {
-                    operations.lock().unwrap().push(operation);
-                    let decision = match decision {
-                        TestDecision::Allow => {
-                            allowed_flows.lock().unwrap().push(flow_id);
-                            AuthorizationDecision::Allow
+                    let http = matches!(
+                        operation,
+                        NetworkOperation::HttpRequest { .. } | NetworkOperation::SecretUse { .. }
+                    );
+                    let secret_material = match &operation {
+                        NetworkOperation::SecretUse { secret, .. } => {
+                            Some(SecretMaterial::new(format!("resolved-{secret}")))
                         }
-                        TestDecision::Deny => AuthorizationDecision::Deny,
+                        _ => None,
                     };
+                    operations.lock().unwrap().push(operation);
+                    let allowed = match decision {
+                        TestDecision::Allow => true,
+                        TestDecision::Deny => false,
+                        TestDecision::DenyHttpRequests => !http,
+                    };
+                    if allowed {
+                        allowed_flows.lock().unwrap().push(flow_id);
+                    }
                     ControllerMessage::AuthorizationDecision {
                         request_id,
-                        decision,
-                        secret_material: None,
+                        decision: if allowed {
+                            AuthorizationDecision::Allow
+                        } else {
+                            AuthorizationDecision::Deny
+                        },
+                        secret_material: secret_material.filter(|_| allowed),
                     }
                 }
                 RuntimeMessage::FlowClosed { .. } => continue,
