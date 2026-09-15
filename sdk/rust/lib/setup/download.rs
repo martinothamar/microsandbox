@@ -141,6 +141,9 @@ impl Setup {
         lib_dir: &Path,
         libkrunfw_name: &str,
     ) -> MicrosandboxResult<()> {
+        #[cfg(not(unix))]
+        let _ = libkrunfw_name;
+
         if let Some(expected) = self.expected_bundle_sha256.as_deref() {
             verify_bundle_digest(data, expected)?;
         }

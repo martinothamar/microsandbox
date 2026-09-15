@@ -3435,8 +3435,8 @@ mod tests {
             require_tls_identity: true,
         };
         let config = make_config(vec![deferred]);
-        let directory = std::env::temp_dir().join(format!(
-            "microsandbox-network-test-{}-{}",
+        let directory = std::path::Path::new("/tmp").join(format!(
+            "msb-net-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
