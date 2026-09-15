@@ -139,6 +139,15 @@ pub fn resolve_runtime(config: &GlobalConfig) -> MicrosandboxResult<ResolvedRunt
     )
 }
 
+/// The host runtime bundle a release download fetches for this platform.
+fn release_download_url(version: &str) -> String {
+    microsandbox_utils::runtime_bundle_download_url(
+        version,
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+    )
+}
+
 /// Install a complete host runtime pair from an explicit source.
 pub async fn install_runtime(
     config: &GlobalConfig,
@@ -146,11 +155,7 @@ pub async fn install_runtime(
 ) -> MicrosandboxResult<ResolvedRuntime> {
     let archive = match &options.source {
         InstallSource::ReleaseDownload => {
-            let url = microsandbox_utils::bundle_download_url(
-                &options.version,
-                std::env::consts::ARCH,
-                std::env::consts::OS,
-            );
+            let url = release_download_url(&options.version);
             tracing::info!(version = %options.version, %url, "downloading microsandbox runtime");
             download_bytes(&url).await?
         }
@@ -665,6 +670,17 @@ fn resolved_installed(config: &GlobalConfig) -> MicrosandboxResult<ResolvedRunti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_downloads_use_the_downstream_runtime_release() {
+        let url = super::release_download_url("0.7.4-digdir.1");
+        assert!(
+            url.starts_with(
+                "https://github.com/martinothamar/microsandbox/releases/download/digdir-v0.7.4-digdir.1/microsandbox-"
+            ),
+            "{url}"
+        );
+    }
 
     fn archive_bytes(entries: &[(&str, tar::EntryType, &[u8])]) -> Vec<u8> {
         let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());

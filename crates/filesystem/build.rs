@@ -7,7 +7,7 @@ use std::time::SystemTime;
 #[cfg(feature = "embed-binaries")]
 use microsandbox_utils::AGENTD_BINARY;
 #[cfg(feature = "download-binaries")]
-use microsandbox_utils::{PREBUILT_VERSION, agentd_download_url, http_client};
+use microsandbox_utils::{PREBUILT_VERSION, http_client, runtime_agentd_download_url};
 
 #[cfg(feature = "embed-binaries")]
 #[path = "lib/agentd/format.rs"]
@@ -61,7 +61,7 @@ fn stage_agentd(workspace_root: &Path, out_dir: &Path) {
 
     #[cfg(feature = "download-binaries")]
     {
-        let url = agentd_download_url(PREBUILT_VERSION, &target_arch);
+        let url = runtime_agentd_download_url(PREBUILT_VERSION, &target_arch);
         download_to(&url, &destination);
         validate_agentd_file(&destination, &target_arch);
     }

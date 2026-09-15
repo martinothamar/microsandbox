@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 #[cfg(all(feature = "download-binaries", unix))]
 use microsandbox_utils::LIBKRUNFW_ABI;
 #[cfg(feature = "download-binaries")]
-use microsandbox_utils::{PREBUILT_VERSION, bundle_download_url, http_client, resolve_home};
+use microsandbox_utils::{
+    PREBUILT_VERSION, http_client, resolve_home, runtime_bundle_download_url,
+};
 #[cfg(any(feature = "download-binaries", feature = "embed-binaries"))]
 use microsandbox_utils::{libkrunfw_filename, msb_binary_filename};
 
@@ -194,7 +196,7 @@ fn download_release_archive() -> Vec<u8> {
     // Build scripts run for the host, so Rust's compile-time architecture constants describe the
     // ARM64 Surface even when Cargo is producing an x64 binary for Prism. Cargo's target variables
     // are the source of truth for selecting the distributable runtime bundle.
-    let url = bundle_download_url(PREBUILT_VERSION, &target_arch(), &target_os());
+    let url = runtime_bundle_download_url(PREBUILT_VERSION, &target_arch(), &target_os());
     println!("cargo:warning=downloading microsandbox runtime v{PREBUILT_VERSION} from {url}");
     let response = http_client()
         .get(&url)
