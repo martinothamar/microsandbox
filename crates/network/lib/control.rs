@@ -706,7 +706,10 @@ async fn run_host_listener(
     mut outgoing: mpsc::Receiver<Zeroizing<Vec<u8>>>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
+    #[cfg(unix)]
     let _cleanup = HostEndpointCleanup(endpoint.clone());
+    #[cfg(windows)]
+    let _cleanup = HostEndpointCleanup;
     loop {
         let connection = tokio::select! {
             result = accept_host_connection(&mut listener, &endpoint) => match result {
@@ -790,18 +793,17 @@ where
     writer.flush().await
 }
 
+#[cfg(unix)]
 struct HostEndpointCleanup(PathBuf);
+
+#[cfg(windows)]
+struct HostEndpointCleanup;
 
 #[cfg(unix)]
 impl Drop for HostEndpointCleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
-}
-
-#[cfg(windows)]
-impl Drop for HostEndpointCleanup {
-    fn drop(&mut self) {}
 }
 
 async fn run_client(
@@ -1129,8 +1131,18 @@ pub(crate) mod test_support {
     impl TestController {
         /// Bind a fresh endpoint and connect a runtime client to it.
         pub(crate) async fn start(decision: TestDecision) -> Self {
-            let directory = std::env::temp_dir().join(format!(
-                "microsandbox-network-control-{}-{}",
+            let mut directory = {
+                #[cfg(unix)]
+                {
+                    PathBuf::from("/tmp")
+                }
+                #[cfg(windows)]
+                {
+                    std::env::temp_dir()
+                }
+            };
+            directory.push(format!(
+                "msb-nc-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1138,7 +1150,7 @@ pub(crate) mod test_support {
                     .as_nanos()
             ));
             std::fs::create_dir_all(&directory).unwrap();
-            let endpoint = directory.join("network-control.sock");
+            let endpoint = directory.join("control.sock");
             let host = NetworkControlHost::bind(endpoint.clone())
                 .await
                 .unwrap()
