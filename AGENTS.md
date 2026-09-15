@@ -279,7 +279,6 @@ The full local setup and build loop is documented in `DEVELOPMENT.md`. Use `just
 - Use a scope when it clarifies the affected area, for example `fix(network): ...` or `docs(sdk): ...`.
 - Keep the subject imperative, lowercase after the colon, no trailing period, and at most 72 characters.
 - Include a commit body for non-trivial changes. Explain what changed and why.
-- Use signed commits: `git commit -S`.
 - Before committing, inspect the actual diff, including new, modified, and deleted files. Do not write a commit message from filenames or previous commit messages alone.
 - If there is nothing to commit, say so rather than creating an empty commit.
 

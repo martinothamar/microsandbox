@@ -2,7 +2,7 @@
 
 This guide covers everything you need to build, test, and release microsandbox from source.
 
-For contribution guidelines (forking, commit signing, pull requests), see [CONTRIBUTING.md](./CONTRIBUTING.md).
+For contribution guidelines (forking and pull requests), see [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 ## Prerequisites
 
