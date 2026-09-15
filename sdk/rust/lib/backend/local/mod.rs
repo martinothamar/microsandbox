@@ -67,13 +67,15 @@ pub struct LocalBackend {
 /// All fields are optional. [`build`](Self::build)`.await` produces a
 /// `LocalBackend` whose DB pool has already been opened and migrated.
 ///
-/// `build` overlays the builder's overrides on top of the persisted
-/// `~/.microsandbox/config.json` (honouring `MSB_CONFIG_PATH`). Persisted
-/// values fill in everything the builder didn't set; builder overrides win.
-/// Override the `home()` setter to point the merge at a different config
-/// file (the underlying loader still respects `MSB_CONFIG_PATH`).
+/// By default, `build` overlays the builder's overrides on top of the
+/// persisted `~/.microsandbox/config.json` (honouring `MSB_CONFIG_PATH`).
+/// Persisted values fill in everything the builder didn't set; builder
+/// overrides win. Embedders that own the complete runtime configuration can
+/// call [`ignore_persisted_config`](Self::ignore_persisted_config) to build on
+/// [`GlobalConfig::default`] instead.
 #[derive(Default)]
 pub struct LocalBackendBuilder {
+    ignore_persisted_config: bool,
     home: Option<PathBuf>,
     sandboxes_dir: Option<PathBuf>,
     volumes_dir: Option<PathBuf>,
@@ -261,6 +263,16 @@ impl LocalBackend {
 }
 
 impl LocalBackendBuilder {
+    /// Build from hard-coded defaults without reading persisted user config.
+    ///
+    /// This is intended for embedding applications that own the complete
+    /// backend configuration and must not inherit process-external state from
+    /// `~/.microsandbox/config.json` or `MSB_CONFIG_PATH`.
+    pub fn ignore_persisted_config(mut self) -> Self {
+        self.ignore_persisted_config = true;
+        self
+    }
+
     /// Override the home directory (default: `~/.microsandbox`).
     pub fn home(mut self, path: impl Into<PathBuf>) -> Self {
         self.home = Some(path.into());
@@ -399,10 +411,11 @@ impl LocalBackendBuilder {
 
     /// Build the `LocalBackend`. Opens the DB pool and applies migrations.
     ///
-    /// Reads `~/.microsandbox/config.json` (or `MSB_CONFIG_PATH`) and
-    /// overlays the builder's overrides on top. Builder values win;
-    /// anything the builder didn't set falls through to the persisted
-    /// config (or the hard-coded defaults if no config file exists).
+    /// Unless [`ignore_persisted_config`](Self::ignore_persisted_config) was
+    /// selected, reads `~/.microsandbox/config.json` (or `MSB_CONFIG_PATH`)
+    /// and overlays the builder's overrides on top. Builder values win;
+    /// anything the builder didn't set falls through to the persisted config
+    /// (or the hard-coded defaults if no config file exists).
     pub async fn build(self) -> MicrosandboxResult<LocalBackend> {
         let backend = self.build_lazy();
         let _ = backend.db().await?;
@@ -417,7 +430,11 @@ impl LocalBackendBuilder {
     /// sandbox state. Persisted-config read or parse errors fall back to hard-coded
     /// defaults; use [`try_build_lazy`](Self::try_build_lazy) to propagate them.
     pub fn build_lazy(self) -> LocalBackend {
-        let persisted = load_persisted_config_or_default().unwrap_or_default();
+        let persisted = if self.ignore_persisted_config {
+            GlobalConfig::default()
+        } else {
+            load_persisted_config_or_default().unwrap_or_default()
+        };
         self.build_lazy_from(persisted)
     }
 
@@ -425,9 +442,16 @@ impl LocalBackendBuilder {
     ///
     /// Unlike [`build_lazy`](Self::build_lazy), this constructor does not fall
     /// back to hard-coded defaults when the configured file is unreadable or
-    /// invalid. The database still initializes only on first use.
+    /// invalid. The database still initializes only on first use. With
+    /// [`ignore_persisted_config`](Self::ignore_persisted_config) no file is
+    /// read, so this cannot fail.
     pub fn try_build_lazy(self) -> MicrosandboxResult<LocalBackend> {
-        Ok(self.build_lazy_from(load_persisted_config_or_default()?))
+        let persisted = if self.ignore_persisted_config {
+            GlobalConfig::default()
+        } else {
+            load_persisted_config_or_default()?
+        };
+        Ok(self.build_lazy_from(persisted))
     }
 
     /// Finish lazy construction from an already resolved persisted config.
@@ -445,6 +469,7 @@ impl LocalBackendBuilder {
     /// `None` builder fields fall through to `base`.
     fn merge_into(self, mut base: GlobalConfig) -> GlobalConfig {
         let LocalBackendBuilder {
+            ignore_persisted_config: _,
             home,
             sandboxes_dir,
             volumes_dir,
@@ -1522,5 +1547,29 @@ mod tests {
             .merge_into(base);
 
         assert_eq!(merged.ssh.inactivity_timeout_secs, 0);
+    }
+
+    #[test]
+    fn builder_can_ignore_persisted_config() {
+        let _env_guard = crate::test_support::lock_env();
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.json");
+        let mut persisted = GlobalConfig::default();
+        persisted.sandbox_defaults.cpus = 7;
+        std::fs::write(&config_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+
+        // SAFETY: every environment-mutating SDK unit test holds the shared lock.
+        unsafe { std::env::set_var("MSB_CONFIG_PATH", &config_path) };
+        let inherited = LocalBackend::builder().build_lazy();
+        let isolated = LocalBackend::builder()
+            .ignore_persisted_config()
+            .build_lazy();
+        unsafe { std::env::remove_var("MSB_CONFIG_PATH") };
+
+        assert_eq!(inherited.config().sandbox_defaults.cpus, 7);
+        assert_eq!(
+            isolated.config().sandbox_defaults.cpus,
+            GlobalConfig::default().sandbox_defaults.cpus
+        );
     }
 }

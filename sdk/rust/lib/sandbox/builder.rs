@@ -94,11 +94,23 @@ impl SandboxBuilder {
     /// [`replace`](Self::replace) is set) and no longer than 128 UTF-8 bytes.
     /// Built-in defaults are applied first, followed by the active global `config.json`.
     pub fn new(name: impl Into<String>) -> Self {
+        // Overlay the global `config.json` defaults on the hardcoded defaults.
+        Self::from_builtin_defaults(name).apply_global_config()
+    }
+
+    /// Start building a sandbox configuration from the built-in defaults only.
+    ///
+    /// Unlike [`new`](Self::new), this does not read the active backend's
+    /// global `config.json` sandbox defaults. It is intended for embedding
+    /// applications that own the complete sandbox configuration and must not
+    /// inherit process-external state, in the same way that
+    /// `LocalBackendBuilder::ignore_persisted_config` isolates the backend.
+    pub fn from_builtin_defaults(name: impl Into<String>) -> Self {
         // Start with the hardcoded sandbox defaults.
         let mut config = SandboxConfig::default();
         config.spec.name = name.into();
 
-        let builder = Self {
+        Self {
             config,
             detached: false,
             build_error: None,
@@ -107,10 +119,7 @@ impl SandboxBuilder {
             config_scripts: BTreeMap::new(),
             pending_snapshot: None,
             pending_snapshot_from_config: false,
-        };
-
-        // Overlay the global `config.json` defaults on the hardcoded defaults.
-        builder.apply_global_config()
+        }
     }
 
     /// Overlay sparse sandbox configuration on the hardcoded and global defaults.
@@ -1789,6 +1798,35 @@ mod tests {
     use microsandbox_types::{PortProtocol, SecretSource};
     #[cfg(feature = "net")]
     use std::net::{IpAddr, Ipv4Addr};
+
+    #[tokio::test]
+    async fn from_builtin_defaults_skips_the_global_config_overlay() {
+        let backend: std::sync::Arc<dyn crate::backend::Backend> = std::sync::Arc::new(
+            crate::backend::LocalBackend::builder()
+                .ignore_persisted_config()
+                .default_cpus(7)
+                .default_memory_mib(3072)
+                .build_lazy(),
+        );
+        let builtin = crate::sandbox::config::SandboxConfig::default();
+
+        let (overlaid, isolated) = crate::backend::with_backend(backend, async {
+            (
+                SandboxBuilder::new("overlaid").config,
+                SandboxBuilder::from_builtin_defaults("isolated").config,
+            )
+        })
+        .await;
+
+        assert_eq!(overlaid.spec.resources.cpus, 7);
+        assert_eq!(overlaid.spec.resources.memory_mib, 3072);
+        assert_eq!(isolated.spec.resources.cpus, builtin.spec.resources.cpus);
+        assert_eq!(
+            isolated.spec.resources.memory_mib,
+            builtin.spec.resources.memory_mib
+        );
+        assert_eq!(isolated.spec.runtime.shell, builtin.spec.runtime.shell);
+    }
 
     #[test]
     fn deployment_profile_sets_sandbox_spec() {
