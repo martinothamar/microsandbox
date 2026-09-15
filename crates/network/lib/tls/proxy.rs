@@ -26,7 +26,9 @@ use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::proxy::ResolvedOutboundProxy;
 use crate::secrets::config::ViolationAction;
 use crate::secrets::handler::SecretsHandler;
-use crate::tcp::{connection::ProxyConnectState, upstream::UpstreamTcpTarget};
+use crate::tcp::{
+    connection::ProxyConnectState, proxy::load_controlled_secrets, upstream::UpstreamTcpTarget,
+};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -298,6 +300,7 @@ impl TlsProxy {
                 proxy_connect,
                 upstream_stream,
                 outbound_proxy,
+                controller,
                 control_grant,
             )
             .await
@@ -403,16 +406,22 @@ pub(crate) async fn intercept_relay(
     proxy_connect: Arc<ProxyConnectState>,
     upstream_stream: Option<TcpStream>,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
+    controller: Option<NetworkControlClient>,
     mut control_grant: Option<NetworkGrant>,
 ) -> io::Result<()> {
     // Per-connection snapshot: live secret updates apply to later connections.
-    let secrets = tls_state.secrets.load();
+    // The controller's deferred entries join only after the transport flow was
+    // authorized above.
+    let secrets = load_controlled_secrets(tls_state.secrets.load(), controller.as_ref()).await?;
     let mut secrets_handler = if via_connect {
         SecretsHandler::new_tls_intercepted_via_connect(&secrets, sni_name)
     } else {
         SecretsHandler::new_tls_intercepted(&secrets, sni_name, guest_dst.ip(), &shared)
     }
     .with_guest_dst(guest_dst);
+    if let Some(controller) = &controller {
+        secrets_handler = secrets_handler.with_controller(controller.clone());
+    }
 
     // Get or generate per-domain certificate (includes cached ServerConfig).
     let domain_cert = tls_state

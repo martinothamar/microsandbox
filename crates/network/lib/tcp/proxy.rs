@@ -21,8 +21,8 @@ use super::connection::ProxyConnectState;
 use super::connection::ProxyConnectStatus;
 use super::upstream::UpstreamTcpTarget;
 use crate::control::{
-    NetworkControlClient, NetworkGrant, NetworkOperation, TransportProtocol, unless_revoked,
-    wait_for_revocation,
+    HttpScheme as ControlHttpScheme, HttpVersion as ControlHttpVersion, NetworkControlClient,
+    NetworkGrant, NetworkOperation, TransportProtocol, unless_revoked, wait_for_revocation,
 };
 use crate::netstack::poll::is_host_destined;
 use crate::netstack::shared::SharedState;
@@ -103,6 +103,15 @@ impl ConnectRequest {
 }
 
 impl ConnectTarget {
+    /// The `host:port` authority as parsed from the CONNECT request line.
+    fn authority(&self) -> String {
+        if self.host.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+
     fn is_intercepted(&self, tls_state: &TlsState) -> bool {
         tls_state.config.intercepted_ports.contains(&self.port)
     }
@@ -272,6 +281,29 @@ impl TcpProxy {
             }
         }
 
+        // Controlled networking also needs the trusted HTTP authority before its
+        // transport authorization. TLS supplies that identity through SNI; for
+        // plain HTTP, finish buffering the header block and use its Host field.
+        // This must happen before `NetworkOperation::Connect`, otherwise a
+        // fail-closed controller sees `hostname: None` and rejects the flow before
+        // the later HTTP-request authorization can run.
+        let mut control_hostname = sni;
+        if controller.is_some() && control_hostname.is_none() {
+            if initial_buf.is_empty() {
+                let (peeked, peeked_sni) =
+                    peek_for_sni(&mut from_smoltcp, PEEK_BUF_SIZE, PEEK_BUDGET).await;
+                initial_buf = peeked;
+                control_hostname = peeked_sni;
+            }
+            if control_hostname.is_none() {
+                let (peeked, http_host) =
+                    peek_for_http_host(initial_buf, &mut from_smoltcp, PEEK_BUF_SIZE, PEEK_BUDGET)
+                        .await;
+                initial_buf = peeked;
+                control_hostname = http_host;
+            }
+        }
+
         // Controlled networking authorizes the guest's logical destination
         // before any host socket opens. The same grant covers direct and
         // SOCKS transport alike: the operator-configured proxy is never the
@@ -283,7 +315,7 @@ impl TcpProxy {
                         source: None,
                         destination: guest_dst,
                         transport: TransportProtocol::Tcp,
-                        hostname: sni.clone(),
+                        hostname: control_hostname,
                         destination_is_host: is_host_destined(guest_dst, connect_target.primary()),
                     })
                     .await
@@ -299,6 +331,9 @@ impl TcpProxy {
             }
             None => None,
         };
+        // The controller's deferred secret entries join the static configuration
+        // only after the transport flow itself was authorized.
+        let secrets = load_controlled_secrets(secrets, controller.as_ref()).await?;
 
         // Peek for HTTP CONNECT before dialing upstream; hand off if detected.
         if let Some(tls_state) = tls_state.clone() {
@@ -351,6 +386,7 @@ impl TcpProxy {
         // (`is_tls` only matters for deciding whether to build the handler).
         let enforce_http_authority = network_policy.has_domain_rules();
         let want_headers = enforce_http_authority
+            || controller.is_some()
             || secrets.has_plain_http_candidates()
             || secrets.has_host_scoped_secrets();
         let (initial_buf, is_tls) = if want_headers {
@@ -405,6 +441,10 @@ impl TcpProxy {
         }
 
         let mut late_connect_state = tls_state;
+        // Upstream's authority validation and the controller's request
+        // authorization are independent: the handler validates the authority
+        // first, then asks the controller, then retrieves secret material. A
+        // request that fails authority validation never reaches the controller.
         let mut secrets_handler: Option<SecretsHandler> = if is_tls {
             None
         } else if enforce_http_authority {
@@ -416,7 +456,7 @@ impl TcpProxy {
                 network_policy.clone(),
                 shared.clone(),
             ))
-        } else if !secrets.secrets.is_empty() {
+        } else if controller.is_some() || !secrets.secrets.is_empty() {
             Some(match extract_http_host(&initial_buf) {
                 Some(host) => {
                     SecretsHandler::new_plain_http(&secrets, &host, guest_dst.ip(), &shared)
@@ -425,7 +465,14 @@ impl TcpProxy {
             })
         } else {
             None
-        };
+        }
+        .map(|handler| {
+            let handler = handler.with_guest_dst(guest_dst);
+            match &controller {
+                Some(controller) => handler.with_controller(controller.clone()),
+                None => handler,
+            }
+        });
 
         // Replay the buffered first flight — run through secrets handler first.
         if !initial_buf.is_empty() {
@@ -646,6 +693,33 @@ fn strict_hostname_allow_is_opaque(
     network_policy.allows_egress_via_hostname(guest_dst, Protocol::Tcp, shared, source)
 }
 
+/// Merge the controller's deferred secret entries into the static secrets
+/// configuration for one connection.
+///
+/// The controller supplies the entries during its handshake; a controller
+/// that cannot be reached fails closed.
+pub(crate) async fn load_controlled_secrets(
+    secrets: Arc<SecretsConfig>,
+    controller: Option<&NetworkControlClient>,
+) -> io::Result<Arc<SecretsConfig>> {
+    let Some(controller) = controller else {
+        return Ok(secrets);
+    };
+    let controlled = controller
+        .secrets_config()
+        .await
+        .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
+    if controlled.secrets.is_empty() {
+        return Ok(secrets);
+    }
+    let mut merged = secrets.as_ref().clone();
+    merged.secrets.extend(controlled.secrets.iter().cloned());
+    merged
+        .validate()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(Arc::new(merged))
+}
+
 /// Forward an HTTP CONNECT tunnel: dial the proxy, splice the handshake,
 /// then hand the established stream to [`TlsProxy`] for TLS MITM.
 ///
@@ -685,6 +759,25 @@ async fn handle_connect_tunnel(
             return Ok(());
         }
     };
+
+    // The transport grant covers the proxy connection; the CONNECT target
+    // itself is a separate HTTP request that the controller authorizes before
+    // any of its headers are forwarded, whether or not the tunnel is intercepted.
+    if let Some(controller) = controller.as_ref() {
+        let grant = controller
+            .authorize(NetworkOperation::HttpRequest {
+                destination: guest_dst,
+                scheme: ControlHttpScheme::Http,
+                authority: connect_req.target.authority(),
+                method: "CONNECT".to_string(),
+                path: String::new(),
+                version: ControlHttpVersion::Http1,
+                stream_id: None,
+            })
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
+        drop(grant);
+    }
 
     // Dial the proxy and forward the CONNECT request so it opens the tunnel.
     let mut proxy_stream = match preconnected_proxy {
@@ -1309,6 +1402,44 @@ async fn peek_for_sni(
     (buf, canonical)
 }
 
+/// Buffer a plain-HTTP first flight until its trusted Host field is available.
+///
+/// Non-HTTP protocols return immediately once their prefix cannot be an HTTP
+/// request. Slow or malformed HTTP falls through without an identity after the
+/// same bounded budget used by the SNI peek.
+async fn peek_for_http_host(
+    mut buf: Vec<u8>,
+    rx: &mut mpsc::Receiver<Bytes>,
+    max: usize,
+    budget: Duration,
+) -> (Vec<u8>, Option<String>) {
+    let timeout_fut = tokio::time::sleep(budget);
+    tokio::pin!(timeout_fut);
+
+    loop {
+        if let Some(host) = extract_http_host(&buf) {
+            return (buf, Some(host));
+        }
+        if !buf.is_empty()
+            && (!looks_like_http_request_prefix(&buf) || first_line_is_not_http_request(&buf))
+        {
+            return (buf, None);
+        }
+        if buf.len() >= max {
+            return (buf, None);
+        }
+
+        tokio::select! {
+            biased;
+            _ = &mut timeout_fut => return (buf, None),
+            data = rx.recv() => match data {
+                Some(bytes) => buf.extend_from_slice(&bytes),
+                None => return (buf, None),
+            }
+        }
+    }
+}
+
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
@@ -1680,6 +1811,62 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn controlled_connect_target_is_authorized_before_headers_are_forwarded() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let controller = TestController::start(TestDecision::Deny).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let (from_tx, from_rx) = mpsc::channel(1);
+        let (to_tx, _to_rx) = mpsc::channel(1);
+        drop(from_tx);
+        let tls_state = Arc::new(
+            TlsState::new(
+                microsandbox_types::TlsConfig::default(),
+                crate::secrets::handle::SecretsHandle::new(SecretsConfig::default()),
+            )
+            .unwrap(),
+        );
+
+        let error = handle_connect_tunnel(
+            proxy_addr,
+            UpstreamTcpTarget::direct(proxy_addr),
+            b"CONNECT example.com:80 HTTP/1.1\r\nHost: example.com:80\r\n\r\n".to_vec(),
+            from_rx,
+            to_tx,
+            Arc::new(SharedState::new(4)),
+            Arc::new(NetworkPolicy::allow_all()),
+            tls_state,
+            false,
+            Arc::new(ProxyConnectState::new()),
+            None,
+            None,
+            Some(controller.client()),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let operations = controller.wait_for_operations(1).await;
+        assert!(
+            matches!(
+                &operations[0],
+                NetworkOperation::HttpRequest { authority, method, .. }
+                    if authority == "example.com:80" && method == "CONNECT"
+            ),
+            "{operations:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "a denied CONNECT target must not reach the proxy"
+        );
+    }
+
+    #[tokio::test]
     async fn controlled_connect_revoked_after_preconnect_forwards_nothing() {
         use crate::control::test_support::{TestController, TestDecision};
 
@@ -1802,6 +1989,7 @@ pub(crate) mod tests {
         assert_eq!(target.host, "2001:db8::1");
         assert_eq!(target.port, 8443);
         assert_eq!(target.expected_sni, None);
+        assert_eq!(target.authority(), "[2001:db8::1]:8443");
     }
 
     #[test]
@@ -1908,6 +2096,37 @@ pub(crate) mod tests {
             elapsed < Duration::from_millis(500),
             "non-TLS bail must be fast: took {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn peek_for_http_host_buffers_split_headers() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.send(Bytes::from_static(b"GET / HTTP/1.1\r\nHo"))
+            .await
+            .unwrap();
+        tx.send(Bytes::from_static(b"st: Example.COM\r\n\r\n"))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let (buf, host) = peek_for_http_host(Vec::new(), &mut rx, PEEK_BUF_SIZE, PEEK_BUDGET).await;
+
+        assert_eq!(host.as_deref(), Some("example.com"));
+        assert_eq!(buf, b"GET / HTTP/1.1\r\nHost: Example.COM\r\n\r\n");
+    }
+
+    #[tokio::test]
+    async fn peek_for_http_host_returns_non_http_bytes_unchanged() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.send(Bytes::from_static(b"SSH-2.0-OpenSSH_10.0\r\n"))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let (buf, host) = peek_for_http_host(Vec::new(), &mut rx, PEEK_BUF_SIZE, PEEK_BUDGET).await;
+
+        assert_eq!(host, None);
+        assert_eq!(buf, b"SSH-2.0-OpenSSH_10.0\r\n");
     }
 
     //----------------------------------------------------------------------------------------------
