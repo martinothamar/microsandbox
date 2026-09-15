@@ -165,6 +165,10 @@ pub struct Config {
     /// Path to the Unix domain socket for the agent relay.
     pub agent_sock_path: PathBuf,
 
+    /// Whether host-controlled Network authorization is required.
+    #[cfg(feature = "net")]
+    pub network_controlled: bool,
+
     /// Startup command to execute after agentd reports ready.
     pub startup_command: Option<StartupCommand>,
 
@@ -2550,6 +2554,13 @@ fn build_vm(
             network = network
                 .with_captured_gateway_mac(gateway)
                 .map_err(|err| RuntimeError::Custom(format!("restore network: {err}")))?;
+        }
+        if config.network_controlled {
+            let endpoint = crate::ipc::network_control_endpoint_for(&config.agent_sock_path);
+            network.set_controller(microsandbox_network::control::NetworkControlClient::new(
+                endpoint,
+                &tokio_handle,
+            ));
         }
         network_termination_handle = Some(network.termination_handle());
         network_metrics_handle = Some(network.metrics_handle());

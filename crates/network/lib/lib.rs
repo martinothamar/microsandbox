@@ -19,6 +19,8 @@ mod engine;
 mod model;
 pub mod proxy;
 
+#[cfg(feature = "control")]
+pub mod control;
 #[cfg(feature = "engine")]
 pub(crate) use engine::addr;
 #[cfg(feature = "engine")]

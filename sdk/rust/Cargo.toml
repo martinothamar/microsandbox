@@ -57,7 +57,7 @@ download-binaries = [
 embed-binaries = [
     "local",
 ]
-net = ["dep:microsandbox-network", "microsandbox-runtime?/net"]
+net = ["dep:microsandbox-network", "microsandbox-network/control", "microsandbox-runtime?/net"]
 
 [dependencies]
 microsandbox-filesystem = { workspace = true, optional = true }
