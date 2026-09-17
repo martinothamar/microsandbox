@@ -365,6 +365,12 @@ type HostListener = tokio::net::windows::named_pipe::NamedPipeServer;
 #[cfg(windows)]
 type HostConnection = tokio::net::windows::named_pipe::NamedPipeServer;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostConnectionExit {
+    Closed,
+    Shutdown,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
@@ -721,10 +727,10 @@ async fn run_host_listener(
             },
             _ = &mut shutdown => break,
         };
-        if let Err(error) =
-            run_host_connection(connection, &incoming, &mut outgoing, &mut shutdown).await
-        {
-            tracing::debug!(%error, "Network control connection closed");
+        match run_host_connection(connection, &incoming, &mut outgoing, &mut shutdown).await {
+            Ok(HostConnectionExit::Closed) => {}
+            Ok(HostConnectionExit::Shutdown) => break,
+            Err(error) => tracing::debug!(%error, "Network control connection closed"),
         }
         while outgoing.try_recv().is_ok() {}
     }
@@ -735,7 +741,7 @@ async fn run_host_connection(
     incoming: &mpsc::Sender<Zeroizing<Vec<u8>>>,
     outgoing: &mut mpsc::Receiver<Zeroizing<Vec<u8>>>,
     shutdown: &mut oneshot::Receiver<()>,
-) -> io::Result<()> {
+) -> io::Result<HostConnectionExit> {
     let (mut reader, mut writer) = tokio::io::split(connection);
     loop {
         tokio::select! {
@@ -744,13 +750,13 @@ async fn run_host_connection(
                     .send(message)
                     .await
                     .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Network controller stopped"))?,
-                None => return Ok(()),
+                None => return Ok(HostConnectionExit::Closed),
             },
             message = outgoing.recv() => match message {
                 Some(message) => write_frame(&mut writer, &message).await?,
-                None => return Ok(()),
+                None => return Ok(HostConnectionExit::Closed),
             },
-            _ = &mut *shutdown => return Ok(()),
+            _ = &mut *shutdown => return Ok(HostConnectionExit::Shutdown),
         }
     }
 }
@@ -1276,6 +1282,48 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_listener_shuts_down_cleanly_with_an_active_connection() {
+        let directory = std::env::temp_dir().join(format!(
+            "msb-nc-shutdown-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let endpoint = directory.join("control.sock");
+        let listener = bind_host_listener(&endpoint).unwrap();
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(HOST_CHANNEL_CAPACITY);
+        let (_outgoing_tx, outgoing_rx) = mpsc::channel(HOST_CHANNEL_CAPACITY);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(run_host_listener(
+            listener,
+            endpoint.clone(),
+            incoming_tx,
+            outgoing_rx,
+            shutdown_rx,
+        ));
+        let mut connection = tokio::net::UnixStream::connect(&endpoint).await.unwrap();
+        write_frame(&mut connection, b"connected").await.unwrap();
+        let message = tokio::time::timeout(Duration::from_secs(5), incoming_rx.recv())
+            .await
+            .expect("listener should receive from the active connection")
+            .expect("listener should keep the incoming channel open");
+        assert_eq!(&*message, b"connected");
+
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("listener should stop after shutdown")
+            .expect("listener should not panic after shutdown");
+
+        drop(connection);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[tokio::test]
     async fn already_revoked_grant_never_polls_the_action() {
