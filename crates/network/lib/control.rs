@@ -744,19 +744,28 @@ async fn run_host_connection(
 ) -> io::Result<HostConnectionExit> {
     let (mut reader, mut writer) = tokio::io::split(connection);
     loop {
-        tokio::select! {
-            message = read_frame(&mut reader) => match message? {
-                Some(message) => incoming
-                    .send(message)
-                    .await
-                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Network controller stopped"))?,
-                None => return Ok(HostConnectionExit::Closed),
-            },
-            message = outgoing.recv() => match message {
-                Some(message) => write_frame(&mut writer, &message).await?,
-                None => return Ok(HostConnectionExit::Closed),
-            },
-            _ = &mut *shutdown => return Ok(HostConnectionExit::Shutdown),
+        // A length-delimited read must survive writes on the other half. Dropping it after a
+        // partial payload would make the next read interpret payload bytes as a frame length.
+        let message = read_frame(&mut reader);
+        tokio::pin!(message);
+        loop {
+            tokio::select! {
+                result = &mut message => {
+                    match result? {
+                        Some(message) => incoming
+                            .send(message)
+                            .await
+                            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Network controller stopped"))?,
+                        None => return Ok(HostConnectionExit::Closed),
+                    }
+                    break;
+                },
+                message = outgoing.recv() => match message {
+                    Some(message) => write_frame(&mut writer, &message).await?,
+                    None => return Ok(HostConnectionExit::Closed),
+                },
+                _ = &mut *shutdown => return Ok(HostConnectionExit::Shutdown),
+            }
         }
     }
 }
@@ -858,22 +867,41 @@ async fn run_client(
             continue;
         }
 
-        let active = connection.as_mut().expect("connection checked above");
-        tokio::select! {
-            command = commands.recv() => {
-                let Some(command) = command else {
-                    break;
-                };
-                if handle_command(command, Some(&mut active.writer), &mut pending, &mut flows).await.is_err() {
-                    disconnect(&mut connection, &mut pending, &mut flows, &secrets);
+        let mut should_disconnect = false;
+        let mut commands_closed = false;
+        {
+            let active = connection.as_mut().expect("connection checked above");
+            // Keep this future across commands: read_exact is not cancellation-safe after it
+            // has consumed part of a length-delimited message.
+            let message = read_message::<_, ControllerMessage>(&mut active.reader);
+            tokio::pin!(message);
+            loop {
+                tokio::select! {
+                    command = commands.recv() => {
+                        let Some(command) = command else {
+                            commands_closed = true;
+                            break;
+                        };
+                        if handle_command(command, Some(&mut active.writer), &mut pending, &mut flows).await.is_err() {
+                            should_disconnect = true;
+                            break;
+                        }
+                    }
+                    result = &mut message => {
+                        match result {
+                            Ok(Some(message)) => handle_controller_message(message, &mut pending, &mut flows),
+                            Ok(None) | Err(_) => should_disconnect = true,
+                        }
+                        break;
+                    }
                 }
             }
-            message = read_message::<_, ControllerMessage>(&mut active.reader) => {
-                match message {
-                    Ok(Some(message)) => handle_controller_message(message, &mut pending, &mut flows),
-                    Ok(None) | Err(_) => disconnect(&mut connection, &mut pending, &mut flows, &secrets),
-                }
-            }
+        }
+        if commands_closed {
+            break;
+        }
+        if should_disconnect {
+            disconnect(&mut connection, &mut pending, &mut flows, &secrets);
         }
     }
 
@@ -1282,6 +1310,283 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn connect_operation(destination: &str) -> NetworkOperation {
+        NetworkOperation::Connect {
+            source: None,
+            destination: destination.parse().unwrap(),
+            transport: TransportProtocol::Tcp,
+            hostname: None,
+            destination_is_host: false,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn accept_client(listener: &tokio::net::UnixListener) -> tokio::net::UnixStream {
+        let (mut connection, _) = listener.accept().await.unwrap();
+        let hello = read_message::<_, RuntimeMessage>(&mut connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(hello, RuntimeMessage::Hello { .. }));
+        write_message(
+            &mut connection,
+            &ControllerMessage::HelloAccepted {
+                protocol: NETWORK_CONTROL_PROTOCOL.to_string(),
+                secrets: SecretsConfig::default(),
+            },
+        )
+        .await
+        .unwrap();
+        connection
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_connection_preserves_fragmented_read_while_writing() {
+        let (connection, mut peer) = tokio::net::UnixStream::pair().unwrap();
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(HOST_CHANNEL_CAPACITY);
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(HOST_CHANNEL_CAPACITY);
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            run_host_connection(connection, &incoming_tx, &mut outgoing_rx, &mut shutdown_rx).await
+        });
+
+        let first = [b'x', 0xff, 0xff, 0xff, 0xff];
+        peer.write_all(&(first.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        peer.write_all(&first[..1]).await.unwrap();
+        peer.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        outgoing_tx
+            .send(Zeroizing::new(b"outbound".to_vec()))
+            .await
+            .unwrap();
+        let outbound = read_frame(&mut peer).await.unwrap().unwrap();
+        assert_eq!(&*outbound, b"outbound");
+
+        peer.write_all(&first[1..]).await.unwrap();
+        write_frame(&mut peer, b"second").await.unwrap();
+
+        let first_received = tokio::time::timeout(Duration::from_secs(1), incoming_rx.recv())
+            .await
+            .expect("host should finish the fragmented frame")
+            .expect("host connection should stay open");
+        let second_received = tokio::time::timeout(Duration::from_secs(1), incoming_rx.recv())
+            .await
+            .expect("host should read the following frame")
+            .expect("host connection should stay open");
+        assert_eq!(&*first_received, &first);
+        assert_eq!(&*second_received, b"second");
+
+        shutdown_tx.send(()).unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), HostConnectionExit::Shutdown);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn client_preserves_fragmented_read_while_sending_commands() {
+        let directory = PathBuf::from("/tmp").join(format!(
+            "msb-nc-cf-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let endpoint = directory.join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
+        let client = NetworkControlClient::new(endpoint, &tokio::runtime::Handle::current());
+        let mut connection = accept_client(&listener).await;
+
+        let first_client = client.clone();
+        let first = tokio::spawn(async move {
+            first_client
+                .authorize(connect_operation("198.51.100.10:443"))
+                .await
+        });
+        let first_request = read_message::<_, RuntimeMessage>(&mut connection)
+            .await
+            .unwrap()
+            .unwrap();
+        let RuntimeMessage::AuthorizationRequest {
+            request_id: first_id,
+            ..
+        } = first_request
+        else {
+            panic!("expected first authorization request");
+        };
+        let first_response = serde_json::to_vec(&ControllerMessage::AuthorizationDecision {
+            request_id: first_id,
+            decision: AuthorizationDecision::Allow,
+            secret_material: None,
+        })
+        .unwrap();
+        connection
+            .write_all(&(first_response.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        connection.write_all(&first_response[..1]).await.unwrap();
+        connection.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let second_client = client.clone();
+        let second = tokio::spawn(async move {
+            second_client
+                .authorize(connect_operation("198.51.100.11:443"))
+                .await
+        });
+        let second_request = read_message::<_, RuntimeMessage>(&mut connection)
+            .await
+            .unwrap()
+            .unwrap();
+        let RuntimeMessage::AuthorizationRequest {
+            request_id: second_id,
+            ..
+        } = second_request
+        else {
+            panic!("expected second authorization request");
+        };
+
+        connection.write_all(&first_response[1..]).await.unwrap();
+        let _ = write_message(
+            &mut connection,
+            &ControllerMessage::AuthorizationDecision {
+                request_id: second_id,
+                decision: AuthorizationDecision::Allow,
+                secret_material: None,
+            },
+        )
+        .await;
+
+        assert!(first.await.unwrap().is_ok());
+        assert!(second.await.unwrap().is_ok());
+
+        drop(client);
+        drop(connection);
+        drop(listener);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn client_denies_pending_authorization_and_reconnects_after_disconnect() {
+        let directory = PathBuf::from("/tmp").join(format!(
+            "msb-nc-cr-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let endpoint = directory.join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
+        let client = NetworkControlClient::new(endpoint, &tokio::runtime::Handle::current());
+        let mut connection = accept_client(&listener).await;
+
+        let pending_client = client.clone();
+        let pending = tokio::spawn(async move {
+            pending_client
+                .authorize(connect_operation("198.51.100.10:443"))
+                .await
+        });
+        let request = read_message::<_, RuntimeMessage>(&mut connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            request,
+            RuntimeMessage::AuthorizationRequest { .. }
+        ));
+        drop(connection);
+        assert!(matches!(
+            pending.await.unwrap(),
+            Err(AuthorizationError::Denied)
+        ));
+
+        let reconnected_client = client.clone();
+        let reconnected = tokio::spawn(async move {
+            reconnected_client
+                .authorize(connect_operation("198.51.100.11:443"))
+                .await
+        });
+        let mut connection = accept_client(&listener).await;
+        let request = read_message::<_, RuntimeMessage>(&mut connection)
+            .await
+            .unwrap()
+            .unwrap();
+        let RuntimeMessage::AuthorizationRequest { request_id, .. } = request else {
+            panic!("expected authorization request after reconnect");
+        };
+        write_message(
+            &mut connection,
+            &ControllerMessage::AuthorizationDecision {
+                request_id,
+                decision: AuthorizationDecision::Allow,
+                secret_material: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(reconnected.await.unwrap().is_ok());
+
+        drop(client);
+        drop(connection);
+        drop(listener);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnect_denies_pending_authorizations_and_revokes_flows() {
+        let mut connection: Option<Connection> = None;
+        let (response_tx, response_rx) = oneshot::channel();
+        let (pending_revoked_tx, _pending_revoked_rx) = watch::channel(false);
+        let mut pending = HashMap::from([(
+            1,
+            PendingAuthorization {
+                flow_id: 10,
+                response: response_tx,
+                revoked: pending_revoked_tx,
+            },
+        )]);
+        let (revoked_tx, revoked_rx) = watch::channel(false);
+        let mut flows = HashMap::from([(20, revoked_tx)]);
+        let (secrets_tx, secrets_rx) = watch::channel(Some(Arc::new(SecretsConfig::default())));
+
+        disconnect(&mut connection, &mut pending, &mut flows, &secrets_tx);
+
+        let response = response_rx.await.unwrap();
+        assert_eq!(response.decision, AuthorizationDecision::Deny);
+        assert!(response.secret_material.is_none());
+        assert!(*revoked_rx.borrow());
+        assert!(secrets_rx.borrow().is_none());
+        assert!(pending.is_empty());
+        assert!(flows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn full_command_queue_fails_closed() {
+        let (commands, _receiver) = mpsc::channel(1);
+        commands.try_send(Command::Connect).unwrap();
+        let (_secrets_tx, secrets) = watch::channel(None);
+        let client = NetworkControlClient {
+            inner: Arc::new(ClientInner {
+                commands,
+                next_id: AtomicU64::new(1),
+                secrets,
+            }),
+        };
+
+        let result = client
+            .authorize(connect_operation("198.51.100.10:443"))
+            .await;
+
+        assert!(matches!(result, Err(AuthorizationError::Unavailable)));
+    }
 
     #[cfg(unix)]
     #[tokio::test]
