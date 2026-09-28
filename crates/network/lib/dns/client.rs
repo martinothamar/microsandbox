@@ -15,10 +15,13 @@ use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use futures::StreamExt;
 use hickory_net::client::Client as GenericClient;
+use hickory_net::proto::op::{DnsRequest, Message};
 use hickory_net::runtime::TokioRuntimeProvider;
 use hickory_net::tcp::TcpClientStream;
 use hickory_net::udp::UdpClientStream;
+use hickory_net::xfer::DnsHandle;
 use rustls::ClientConfig;
 
 use super::common::transport::Transport;
@@ -127,6 +130,34 @@ pub(super) async fn build_direct_client(
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| addr.ip().to_string());
             build_dot_client(addr, sni, timeout).await
+        }
+    }
+}
+
+/// Send one query through `client`. `None` means this upstream did
+/// not produce a usable answer, which is what makes a caller fall over
+/// to the next one: a per-query timeout and a transport error both
+/// arrive as `Some(Err)`, and a closed stream as `None`.
+///
+/// A response that *arrives* is returned as-is even when it carries
+/// SERVFAIL or REFUSED. That is an answer from a working resolver, not
+/// an unusable server, and re-asking the next one would change what the
+/// sandbox resolves rather than just repairing reachability.
+pub(super) async fn send_query(
+    client: &Client,
+    query_msg: &Message,
+    domain: &str,
+) -> Option<Message> {
+    let mut send = client.send(DnsRequest::from(query_msg.clone()));
+    match send.next().await {
+        Some(Ok(resp)) => Some(resp.into()),
+        Some(Err(e)) => {
+            tracing::warn!(domain = %domain, error = %e, "upstream DNS send failed");
+            None
+        }
+        None => {
+            tracing::warn!(domain = %domain, "upstream DNS closed stream without a response");
+            None
         }
     }
 }

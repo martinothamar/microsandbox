@@ -31,23 +31,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::StreamExt;
-use hickory_net::proto::op::{DnsRequest, Edns, Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_net::proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_net::proto::rr::rdata::{A, AAAA, CNAME};
 use hickory_net::proto::rr::{Name, RData, Record, RecordType};
 use hickory_net::proto::serialize::binary::{BinDecodable, BinEncodable};
-use hickory_net::xfer::DnsHandle;
-use tokio::sync::{OnceCell, watch};
+use tokio::sync::watch;
 
-use super::client::{Client, build_direct_client, build_tcp_client, build_udp_client};
+use super::client::{Client, build_direct_client, send_query};
 use super::common::config::NormalizedDnsConfig;
 use super::common::filter::{is_private_ipv4, is_private_ipv6};
 use super::common::transport::Transport;
-#[cfg(not(windows))]
-use super::nameserver::read_host_dns_servers;
-use super::nameserver::resolve_nameservers;
-#[cfg(windows)]
-use super::windows_resolver::WindowsSystemResolver;
+#[cfg(test)]
+use super::upstream::PinnedUpstreams;
+use super::upstream::{GatewayQuery, Upstream};
 use crate::control::{
     NetworkControlClient, NetworkOperation, TransportProtocol, wait_for_revocation,
 };
@@ -92,10 +88,9 @@ pub(crate) type DnsForwarderHandle = watch::Receiver<Option<Arc<DnsForwarder>>>;
 /// network policy, and normalized DNS config. Cheaply cloneable via
 /// `Arc`.
 pub(crate) struct DnsForwarder {
-    /// Resolver used when the guest queries the gateway IP. Explicitly configured nameservers use
-    /// direct clients; on Windows, host-default queries use the system DNS Client so interface,
-    /// VPN, NRPT and resolver-health policy remains owned by the operating system.
-    configured: ConfiguredResolver,
+    /// Resolver used when the guest queries the gateway IP: explicitly configured nameservers,
+    /// or the host's system resolver.
+    upstream: Upstream,
     /// Set of gateway IPs (v4 + v6). Queries to these IPs go through
     /// the configured upstream; queries to other IPs go through the
     /// direct path subject to network egress policy.
@@ -118,31 +113,6 @@ pub(crate) struct DnsForwarder {
     config: Arc<NormalizedDnsConfig>,
     /// Host authorization endpoint selected for controlled networking.
     controller: Option<NetworkControlClient>,
-}
-
-/// One configured upstream and its per-transport clients.
-struct ConfiguredUpstream {
-    /// SocketAddr of this upstream — needed to build `tcp` on demand
-    /// and for diagnostic logging.
-    addr: SocketAddr,
-    /// UDP client, connected at startup. Cheap to build for every
-    /// upstream: since hickory 0.26 the constructor only wraps a
-    /// request sender, so socket errors surface per-query instead.
-    udp: Client,
-    /// Lazy TCP client. Built on first TCP query that reaches this
-    /// upstream; many sandboxes never use TCP DNS at all, so we don't
-    /// pay the handshake cost up front.
-    tcp: OnceCell<Client>,
-}
-
-/// Backend for queries addressed to the sandbox gateway.
-enum ConfiguredResolver {
-    /// Direct upstreams, tried in order. This covers operator-configured nameservers on every host
-    /// and host-discovered nameservers on Unix.
-    Direct(Vec<ConfiguredUpstream>),
-    /// Native Windows DNS Client used only when no nameserver was explicitly configured.
-    #[cfg(windows)]
-    WindowsSystem(WindowsSystemResolver),
 }
 
 /// Outcome of upstream selection. The query may be forwarded through
@@ -202,13 +172,7 @@ impl DnsForwarder {
     /// rebind protection, active guest address families, and the guest DNS
     /// cache do not apply here.
     pub(crate) async fn resolve_proxy_domain(&self, domain: &str) -> io::Result<Vec<IpAddr>> {
-        #[cfg(windows)]
-        if matches!(&self.configured, ConfiguredResolver::WindowsSystem(_)) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "proxy relay domain resolution requires an explicit DNS nameserver on Windows",
-            ));
-        }
+        self.upstream.check_proxy_resolution()?;
 
         let name = Name::from_ascii(domain).map_err(|error| {
             io::Error::new(
@@ -260,11 +224,8 @@ impl DnsForwarder {
         edns.set_max_payload(4096);
         query.edns = Some(edns);
 
-        let raw_query = query
-            .to_bytes()
-            .map_err(|error| io::Error::other(format!("failed to encode DNS query: {error}")))?;
         let response = self
-            .forward_to_configured(&raw_query, &query, domain, Transport::Udp)
+            .query_upstream(&query, domain, Transport::Udp)
             .await
             .ok_or_else(|| io::Error::other("proxy relay DNS query failed"))?;
 
@@ -364,11 +325,11 @@ impl DnsForwarder {
                 UpstreamChoice::PolicyDenied => Err(()),
                 UpstreamChoice::ServFail => Ok(None),
                 UpstreamChoice::Direct(client) => {
-                    Ok(self.send_query(&client, &query_msg, &domain).await)
+                    Ok(send_query(&client, &query_msg, &domain).await)
                 }
-                UpstreamChoice::Configured => Ok(self
-                    .forward_to_configured(raw_query, &query_msg, &domain, transport)
-                    .await),
+                UpstreamChoice::Configured => {
+                    Ok(self.query_upstream(&query_msg, &domain, transport).await)
+                }
             }
         };
         let response = tokio::select! {
@@ -490,121 +451,24 @@ impl DnsForwarder {
         }
     }
 
-    /// Forward a query to the configured upstreams, in order, stopping
-    /// at the first that answers. Falls over on per-query timeout or
-    /// transport failure, which is the whole point: the guest holds the
-    /// gateway as its only nameserver and cannot try the rest itself.
-    /// `None` when every upstream is unusable.
-    async fn forward_to_configured(
+    /// Resolve a gateway-addressed query through the upstream. `None`
+    /// when no usable answer was obtained.
+    async fn query_upstream(
         &self,
-        _raw_query: &[u8],
         query_msg: &Message,
         domain: &str,
         transport: Transport,
     ) -> Option<Message> {
-        match &self.configured {
-            ConfiguredResolver::Direct(upstreams) => {
-                let total = upstreams.len();
-                for (index, upstream) in upstreams.iter().enumerate() {
-                    let Some(client) = self.client_for(upstream, transport).await else {
-                        continue;
-                    };
-                    if let Some(response) = self.send_query(&client, query_msg, domain).await {
-                        return Some(response);
-                    }
-                    if index + 1 < total {
-                        tracing::debug!(
-                            domain = %domain,
-                            upstream = %upstream.addr,
-                            "upstream DNS unusable, trying next configured nameserver",
-                        );
-                    }
-                }
+        let query = GatewayQuery {
+            message: query_msg,
+            domain,
+            transport,
+        };
+        match self.upstream.query(&query).await {
+            Ok(response) => Some(response),
+            Err(error) => {
+                tracing::warn!(domain = %domain, %error, "gateway DNS query failed");
                 None
-            }
-            #[cfg(windows)]
-            ConfiguredResolver::WindowsSystem(resolver) => {
-                match resolver.query(_raw_query, transport).await {
-                    Ok(response) => match Message::from_bytes(&response) {
-                        Ok(response) => Some(response),
-                        Err(error) => {
-                            tracing::warn!(
-                                domain = %domain,
-                                error = %error,
-                                "Windows system DNS returned an invalid response",
-                            );
-                            None
-                        }
-                    },
-                    Err(error) => {
-                        tracing::warn!(
-                            domain = %domain,
-                            error = %error,
-                            "Windows system DNS query failed",
-                        );
-                        None
-                    }
-                }
-            }
-        }
-    }
-
-    /// Send one query to one upstream. `None` means this upstream did
-    /// not produce a usable answer, which is what makes the caller fall
-    /// over to the next one: a per-query timeout and a transport error
-    /// both arrive as `Some(Err)`, and a closed stream as `None`.
-    ///
-    /// A response that *arrives* is returned as-is even when it carries
-    /// SERVFAIL or REFUSED. That is an answer from a working resolver,
-    /// not an unusable server, and re-asking the next one would change
-    /// what the sandbox resolves rather than just repairing reachability.
-    async fn send_query(
-        &self,
-        client: &Client,
-        query_msg: &Message,
-        domain: &str,
-    ) -> Option<Message> {
-        let mut send = client.send(DnsRequest::from(query_msg.clone()));
-        match send.next().await {
-            Some(Ok(resp)) => Some(resp.into()),
-            Some(Err(e)) => {
-                tracing::warn!(domain = %domain, error = %e, "upstream DNS send failed");
-                None
-            }
-            None => {
-                tracing::warn!(domain = %domain, "upstream DNS closed stream without a response");
-                None
-            }
-        }
-    }
-
-    /// Get the client for one configured upstream on `transport`. UDP
-    /// is shared (pre-connected at startup); TCP is built on first use
-    /// and cached per upstream. DoT guests reuse the TCP client — the
-    /// configured upstream is typically on the host's loopback or
-    /// internal network and serves plain DNS, so re-TLSing there is
-    /// overkill.
-    ///
-    /// Called per upstream as the query walks the list, so an upstream
-    /// that is never reached never pays for a TCP handshake.
-    async fn client_for(
-        &self,
-        upstream: &ConfiguredUpstream,
-        transport: Transport,
-    ) -> Option<Client> {
-        match transport {
-            Transport::Udp => Some(upstream.udp.clone()),
-            Transport::Tcp | Transport::Dot => {
-                let timeout = self.config.query_timeout;
-                let addr = upstream.addr;
-                upstream
-                    .tcp
-                    .get_or_try_init(
-                        || async move { build_tcp_client(addr, timeout).await.ok_or(()) },
-                    )
-                    .await
-                    .ok()
-                    .cloned()
             }
         }
     }
@@ -663,48 +527,16 @@ impl DnsForwarder {
         gateway: GatewayIps,
         controller: Option<NetworkControlClient>,
     ) -> Option<Arc<Self>> {
-        let configured = if !config.nameservers.is_empty() {
-            match resolve_nameservers(&config.nameservers).await {
-                Ok(upstreams) if !upstreams.is_empty() => ConfiguredResolver::Direct(
-                    Self::build_direct_upstreams(upstreams, config.query_timeout).await?,
-                ),
-                Ok(_) => {
-                    tracing::error!("no configured nameservers resolved to an address");
-                    return None;
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to resolve configured nameservers");
-                    return None;
-                }
+        let upstream = match Upstream::from_config(&config).await {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                tracing::error!(%error, "failed to initialize the DNS upstream");
+                return None;
             }
-        } else if cfg!(windows) {
-            #[cfg(windows)]
-            {
-                ConfiguredResolver::WindowsSystem(WindowsSystemResolver::new(config.query_timeout))
-            }
-            #[cfg(not(windows))]
-            unreachable!()
-        } else {
-            #[cfg(not(windows))]
-            match read_host_dns_servers().await {
-                Ok(upstreams) if !upstreams.is_empty() => ConfiguredResolver::Direct(
-                    Self::build_direct_upstreams(upstreams, config.query_timeout).await?,
-                ),
-                Ok(_) => {
-                    tracing::error!("no upstream DNS servers discovered from host");
-                    return None;
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to read host DNS configuration");
-                    return None;
-                }
-            }
-            #[cfg(windows)]
-            unreachable!()
         };
 
         Some(Arc::new(Self {
-            configured,
+            upstream,
             gateway_ips,
             network_policy,
             platform_policy,
@@ -713,30 +545,6 @@ impl DnsForwarder {
             config,
             controller,
         }))
-    }
-
-    /// Build every direct upstream so the gateway path can fall over when one is unreachable.
-    async fn build_direct_upstreams(
-        upstreams: Vec<SocketAddr>,
-        query_timeout: Duration,
-    ) -> Option<Vec<ConfiguredUpstream>> {
-        let mut configured = Vec::with_capacity(upstreams.len());
-        for addr in upstreams {
-            let Some(udp) = build_udp_client(addr, query_timeout).await else {
-                tracing::warn!(upstream = %addr, "skipping upstream: failed to build UDP client");
-                continue;
-            };
-            configured.push(ConfiguredUpstream {
-                addr,
-                udp,
-                tcp: OnceCell::new(),
-            });
-        }
-        if configured.is_empty() {
-            tracing::error!("no upstream DNS client could be built");
-            return None;
-        }
-        Some(configured)
     }
 
     /// Wait until the forwarder cell is populated, then return a
@@ -766,9 +574,9 @@ impl DnsForwarder {
             crate::config::DnsConfig::default(),
         ));
         let upstream = upstream.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 9)));
-        let udp = build_udp_client(upstream, config.query_timeout)
+        let upstream = PinnedUpstreams::new(&[upstream], config.query_timeout)
             .await
-            .expect("test UDP client should initialize");
+            .expect("test upstream should initialize");
         let gateway_ips = Arc::new(
             gateway
                 .ipv4
@@ -779,11 +587,7 @@ impl DnsForwarder {
         );
 
         Arc::new(Self {
-            configured: ConfiguredResolver::Direct(vec![ConfiguredUpstream {
-                addr: upstream,
-                udp,
-                tcp: OnceCell::new(),
-            }]),
+            upstream: Upstream::Pinned(upstream),
             gateway_ips,
             network_policy: Arc::new(NetworkPolicy::allow_all()),
             platform_policy: None,
@@ -1145,19 +949,12 @@ mod tests {
             nameservers: Vec::new(),
             query_timeout: Duration::from_millis(300),
         });
-        let mut configured = Vec::new();
-        for addr in upstreams {
-            configured.push(ConfiguredUpstream {
-                addr: *addr,
-                udp: build_udp_client(*addr, config.query_timeout)
-                    .await
-                    .expect("udp client"),
-                tcp: OnceCell::new(),
-            });
-        }
+        let upstream = PinnedUpstreams::new(upstreams, config.query_timeout)
+            .await
+            .expect("test upstreams should initialize");
         let gateway_ip: IpAddr = "10.0.0.1".parse().unwrap();
         Arc::new(DnsForwarder {
-            configured: ConfiguredResolver::Direct(configured),
+            upstream: Upstream::Pinned(upstream),
             gateway_ips: Arc::new(HashSet::from([gateway_ip])),
             network_policy: Arc::new(NetworkPolicy::from_profiles([NetworkProfile::Public])),
             platform_policy: None,
