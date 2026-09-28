@@ -55,9 +55,10 @@ impl Upstream {
                 "no configured nameservers resolved to an address",
             ));
         }
-        PinnedUpstreams::new(&servers, config.query_timeout)
-            .await
-            .map(Self::Pinned)
+        Ok(Self::Pinned(PinnedUpstreams::new(
+            servers,
+            config.query_timeout,
+        )))
     }
 
     /// Resolve one gateway query. `Ok` carries any response code from a

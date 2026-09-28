@@ -574,9 +574,7 @@ impl DnsForwarder {
             crate::config::DnsConfig::default(),
         ));
         let upstream = upstream.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 9)));
-        let upstream = PinnedUpstreams::new(&[upstream], config.query_timeout)
-            .await
-            .expect("test upstream should initialize");
+        let upstream = PinnedUpstreams::new(vec![upstream], config.query_timeout);
         let gateway_ips = Arc::new(
             gateway
                 .ipv4
@@ -949,9 +947,7 @@ mod tests {
             nameservers: Vec::new(),
             query_timeout: Duration::from_millis(300),
         });
-        let upstream = PinnedUpstreams::new(upstreams, config.query_timeout)
-            .await
-            .expect("test upstreams should initialize");
+        let upstream = PinnedUpstreams::new(upstreams.to_vec(), config.query_timeout);
         let gateway_ip: IpAddr = "10.0.0.1".parse().unwrap();
         Arc::new(DnsForwarder {
             upstream: Upstream::Pinned(upstream),

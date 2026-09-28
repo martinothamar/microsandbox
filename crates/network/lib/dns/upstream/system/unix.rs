@@ -32,7 +32,7 @@ impl SystemResolver {
             ));
         }
         Ok(Self {
-            upstreams: PinnedUpstreams::new(&servers, query_timeout).await?,
+            upstreams: PinnedUpstreams::new(servers, query_timeout),
         })
     }
 
