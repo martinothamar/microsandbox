@@ -289,6 +289,16 @@ impl DnsForwarder {
         let domain = question.name().to_string();
         let domain = domain.trim_end_matches('.').to_owned();
 
+        // Policy compares names as sent, but a system resolver may map
+        // non-ASCII labels to ASCII before resolving (mDNSResponder applies
+        // UTS46, turning fullwidth `ｌｏｃａｌ` into `local`), so such a
+        // name could slip past domain rules and the local-network check.
+        // Clients send internationalized names as ASCII punycode.
+        if !question.name().iter().flatten().all(u8::is_ascii) {
+            tracing::debug!(domain = %domain, "DNS name with non-ASCII bytes refused");
+            return build_status_response(&query_msg, ResponseCode::NXDomain);
+        }
+
         // Refuse queries denied by the network policy. DNS is evaluated
         // as egress over the guest-facing DNS transport, so deny-by-
         // default policies fail closed unless a rule allows the name or
@@ -1434,6 +1444,46 @@ mod tests {
 
         assert_eq!(
             resolve_name_via_gateway(&forwarder, "printer.local.").await,
+            ResponseCode::NoError
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// Names a system resolver could map to other ASCII names are refused
+    /// before policy sees them; punycode passes through.
+    #[tokio::test]
+    async fn non_ascii_names_are_refused() {
+        let (upstream, hits) = responding_udp(Ipv4Addr::new(192, 0, 2, 7)).await;
+        let forwarder = forwarder_over(&[upstream]).await;
+        let gateway: IpAddr = "10.0.0.1".parse().unwrap();
+
+        for labels in [
+            vec!["_services", "_dns-sd", "_udp", "ｌｏｃａｌ"],
+            vec!["evil", "ｃｏｍ"],
+            vec!["ｅｖｉｌ", "com"],
+        ] {
+            let mut query = Message::new(0x4242, MessageType::Query, OpCode::Query);
+            let name = Name::from_labels(labels.iter().map(|label| label.as_bytes())).unwrap();
+            query.add_query(Query::query(name, RecordType::A));
+            let bytes = forwarder
+                .forward(
+                    &query.to_bytes().unwrap(),
+                    Some(gateway),
+                    Transport::Udp,
+                    None,
+                )
+                .await
+                .expect("a response");
+            assert_eq!(response_code(&bytes), ResponseCode::NXDomain, "{labels:?}");
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "no query reaches the upstream"
+        );
+
+        assert_eq!(
+            resolve_name_via_gateway(&forwarder, "xn--bcher-kva.example.").await,
             ResponseCode::NoError
         );
         assert_eq!(hits.load(Ordering::SeqCst), 1);
