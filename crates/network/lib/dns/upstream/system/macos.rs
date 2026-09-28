@@ -1,4 +1,4 @@
-//! Host DNS servers read once when the sandbox network starts.
+//! macOS host DNS servers, read once when the sandbox network starts.
 
 use std::io;
 use std::time::Duration;
