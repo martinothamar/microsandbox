@@ -26,7 +26,7 @@
 
 use std::collections::HashSet;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -70,6 +70,43 @@ const RESOLVED_HOSTNAME_MIN_TTL_SECS: u32 = 1;
 /// enough that the guest re-resolves often, long enough to avoid hammering
 /// the forwarder on each connection.
 const HOST_ALIAS_TTL_SECS: u32 = 60;
+
+/// Local-network address ranges as first and last address: RFC 1918,
+/// CGN, IPv4 link-local, ULA and IPv6 link-local.
+const LOCAL_NETWORK_RANGES: [(IpAddr, IpAddr); 7] = [
+    (
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)),
+        IpAddr::V4(Ipv4Addr::new(10, 255, 255, 255)),
+    ),
+    (
+        IpAddr::V4(Ipv4Addr::new(172, 16, 0, 0)),
+        IpAddr::V4(Ipv4Addr::new(172, 31, 255, 255)),
+    ),
+    (
+        IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)),
+        IpAddr::V4(Ipv4Addr::new(192, 168, 255, 255)),
+    ),
+    (
+        IpAddr::V4(Ipv4Addr::new(100, 64, 0, 0)),
+        IpAddr::V4(Ipv4Addr::new(100, 127, 255, 255)),
+    ),
+    (
+        IpAddr::V4(Ipv4Addr::new(169, 254, 0, 0)),
+        IpAddr::V4(Ipv4Addr::new(169, 254, 255, 255)),
+    ),
+    (
+        IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0)),
+        IpAddr::V6(Ipv6Addr::new(
+            0xfdff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+        )),
+    ),
+    (
+        IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0)),
+        IpAddr::V6(Ipv6Addr::new(
+            0xfebf, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+        )),
+    ),
+];
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -285,6 +322,17 @@ impl DnsForwarder {
             return Some(response);
         }
 
+        // Local-network names describe the host's network: names in the
+        // multicast zones can reach multicast DNS, and reverse names of
+        // private addresses map internal hosts. Rebind protection only
+        // filters address records, so without this their PTR, SRV and TXT
+        // answers would reach a sandbox that may not reach that network.
+        let to_gateway = original_dst.is_none_or(|dst| self.gateway_ips.contains(&dst));
+        if to_gateway && !self.may_resolve_local_network_name(question.name()) {
+            tracing::debug!(domain = %domain, "local-network DNS name refused by network policy");
+            return build_status_response(&query_msg, ResponseCode::NXDomain);
+        }
+
         // Controlled networking authorizes the query before any upstream is
         // contacted and holds the grant for the whole in-flight query.
         let mut control_grant = match &self.controller {
@@ -449,6 +497,34 @@ impl DnsForwarder {
                 }
             }
         }
+    }
+
+    /// Whether this sandbox may resolve `name` if it describes the local
+    /// network. A multicast-zone name needs the sandbox to reach some local
+    /// range; a reverse name of a local address needs rebind protection to
+    /// admit that address, or the whole block a shorter prefix names.
+    fn may_resolve_local_network_name(&self, name: &Name) -> bool {
+        if !self.config.rebind_protection {
+            return true;
+        }
+        let multicast_allowed = !is_multicast_zone_name(name)
+            || LOCAL_NETWORK_RANGES
+                .iter()
+                .any(|&(first, last)| self.admits(first) && self.admits(last));
+        let reverse_allowed = reverse_block(name).is_none_or(|(first, last)| {
+            !is_in_local_network_range(first) || (self.admits(first) && self.admits(last))
+        });
+        multicast_allowed && reverse_allowed
+    }
+
+    /// Whether rebind protection admits `addr` as an answer.
+    fn admits(&self, addr: IpAddr) -> bool {
+        policies_allow_rebind_address(
+            &self.network_policy,
+            self.platform_policy.as_deref(),
+            &self.shared,
+            addr,
+        )
     }
 
     /// Resolve a gateway-addressed query through the upstream. `None`
@@ -813,6 +889,91 @@ fn normalize_dns_name(name: &str) -> String {
     name.trim_end_matches('.').to_ascii_lowercase()
 }
 
+/// Zones mDNSResponder resolves by multicast DNS (its `IsLocalDomain`),
+/// labels from the right.
+const MULTICAST_ZONES: [&[&[u8]]; 6] = [
+    &[b"local"],
+    &[b"arpa", b"in-addr", b"169", b"254"],
+    &[b"arpa", b"ip6", b"f", b"e", b"8"],
+    &[b"arpa", b"ip6", b"f", b"e", b"9"],
+    &[b"arpa", b"ip6", b"f", b"e", b"a"],
+    &[b"arpa", b"ip6", b"f", b"e", b"b"],
+];
+
+/// Whether `name` is in one of the [`MULTICAST_ZONES`], case-insensitively.
+fn is_multicast_zone_name(name: &Name) -> bool {
+    MULTICAST_ZONES.iter().any(|zone| {
+        usize::from(name.num_labels()) >= zone.len()
+            && name
+                .iter()
+                .rev()
+                .zip(zone.iter())
+                .all(|(label, zone_label)| label.eq_ignore_ascii_case(zone_label))
+    })
+}
+
+/// The first and last address of the block a reverse name describes: the
+/// address labels next to `in-addr.arpa` or `ip6.arpa`, up to the first
+/// label that is not part of an address, as in DNS-SD browse names.
+fn reverse_block(name: &Name) -> Option<(IpAddr, IpAddr)> {
+    let labels: Vec<&[u8]> = name.iter().rev().collect();
+    match labels.as_slice() {
+        [arpa, in_addr, rest @ ..]
+            if arpa.eq_ignore_ascii_case(b"arpa") && in_addr.eq_ignore_ascii_case(b"in-addr") =>
+        {
+            let octets: Vec<u8> = rest
+                .iter()
+                .take(4)
+                .map_while(|label| std::str::from_utf8(label).ok()?.parse().ok())
+                .collect();
+            let bits = u32::try_from(octets.len() * 8).ok()?;
+            let mut first = [0u8; 4];
+            first[..octets.len()].copy_from_slice(&octets);
+            let first = u32::from_be_bytes(first);
+            let last = first | u32::MAX.checked_shr(bits).unwrap_or(0);
+            (bits > 0).then(|| {
+                (
+                    IpAddr::V4(Ipv4Addr::from(first)),
+                    IpAddr::V4(Ipv4Addr::from(last)),
+                )
+            })
+        }
+        [arpa, ip6, rest @ ..]
+            if arpa.eq_ignore_ascii_case(b"arpa") && ip6.eq_ignore_ascii_case(b"ip6") =>
+        {
+            let nibbles: Vec<u32> = rest
+                .iter()
+                .take(32)
+                .map_while(|label| match label {
+                    [nibble] => char::from(*nibble).to_digit(16),
+                    _ => None,
+                })
+                .collect();
+            let bits = u32::try_from(nibbles.len() * 4).ok()?;
+            let first = nibbles
+                .iter()
+                .enumerate()
+                .fold(0u128, |acc, (index, &nibble)| {
+                    acc | u128::from(nibble) << (124 - 4 * index)
+                });
+            let last = first | u128::MAX.checked_shr(bits).unwrap_or(0);
+            (bits > 0).then(|| {
+                (
+                    IpAddr::V6(Ipv6Addr::from(first)),
+                    IpAddr::V6(Ipv6Addr::from(last)),
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
+fn is_in_local_network_range(addr: IpAddr) -> bool {
+    LOCAL_NETWORK_RANGES
+        .iter()
+        .any(|&(first, last)| first <= addr && addr <= last)
+}
+
 /// Case-insensitive match against [`crate::HOST_ALIAS`] with trailing-dot tolerance.
 fn is_host_alias_query(query_name: &str) -> bool {
     query_name
@@ -1071,6 +1232,224 @@ mod tests {
             .unwrap()
             .expect("a revoked query gets a synthetic answer");
         assert_eq!(response_code(&response), ResponseCode::NXDomain);
+    }
+
+    async fn resolve_name_via_gateway(forwarder: &DnsForwarder, name: &str) -> ResponseCode {
+        let raw = make_query(name, RecordType::PTR)
+            .to_bytes()
+            .expect("encode query");
+        let gateway: IpAddr = "10.0.0.1".parse().unwrap();
+        let bytes = forwarder
+            .forward(&raw, Some(gateway), Transport::Udp, None)
+            .await
+            .expect("a response");
+        response_code(&bytes)
+    }
+
+    /// A sandbox limited to public egress must not learn about the host's
+    /// local network through multicast DNS or private reverse lookups.
+    #[tokio::test]
+    async fn local_network_names_are_refused_without_local_network_access() {
+        let (upstream, hits) = responding_udp(Ipv4Addr::new(192, 0, 2, 7)).await;
+        let mut forwarder = forwarder_over(&[upstream]).await;
+        Arc::get_mut(&mut forwarder).unwrap().config = Arc::new(NormalizedDnsConfig {
+            rebind_protection: true,
+            nameservers: Vec::new(),
+            query_timeout: Duration::from_millis(300),
+        });
+
+        for name in [
+            "_services._dns-sd._udp.local.",
+            "Printer.LOCAL.",
+            "1.0.254.169.in-addr.arpa.",
+            "1.0.0.0.0.0.0.0.0.0.0.0.0.0.8.e.f.ip6.arpa.",
+            "4.3.2.10.in-addr.arpa.",
+            "10.in-addr.arpa.",
+            "1.0.16.172.in-addr.arpa.",
+            "1.0.168.192.in-addr.arpa.",
+            "1.2.64.100.in-addr.arpa.",
+            "1.0.0.0.d.f.ip6.arpa.",
+            "db._dns-sd._udp.0.0.254.169.in-addr.arpa.",
+            "x.1.0.254.169.in-addr.arpa.",
+            "_services._dns-sd._udp.8.e.f.ip6.arpa.",
+            "b._dns-sd._udp.0.1.168.192.in-addr.arpa.",
+        ] {
+            assert_eq!(
+                resolve_name_via_gateway(&forwarder, name).await,
+                ResponseCode::NXDomain,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "no query reaches the upstream"
+        );
+
+        for name in [
+            "local.example.com.",
+            "8.8.8.8.in-addr.arpa.",
+            "1.1.1.172.in-addr.arpa.",
+            "172.in-addr.arpa.",
+            "1.0.0.2.ip6.arpa.",
+        ] {
+            resolve_name_via_gateway(&forwarder, name).await;
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 5, "other names still resolve");
+    }
+
+    /// Only a whole local range opens the gate: a rule for one subnet or
+    /// host must not expose the rest of the host's network.
+    #[tokio::test]
+    async fn narrow_local_rules_do_not_open_the_local_network_gate() {
+        let (upstream, hits) = responding_udp(Ipv4Addr::new(192, 168, 0, 20)).await;
+        for cidr in ["192.168.0.1/32", "192.168.0.0/24", "10.0.0.0/16"] {
+            let mut forwarder = forwarder_over(&[upstream]).await;
+            let forwarder_mut = Arc::get_mut(&mut forwarder).unwrap();
+            let mut policy = NetworkPolicy::from_profiles([NetworkProfile::Public]);
+            policy.rules.push(Rule {
+                direction: crate::policy::Direction::Egress,
+                destination: Destination::Cidr(cidr.parse().unwrap()),
+                protocols: Vec::new(),
+                ports: Vec::new(),
+                action: Action::Allow,
+            });
+            forwarder_mut.network_policy = Arc::new(policy);
+            forwarder_mut.config = Arc::new(NormalizedDnsConfig {
+                rebind_protection: true,
+                nameservers: Vec::new(),
+                query_timeout: Duration::from_millis(300),
+            });
+            assert_eq!(
+                resolve_name_via_gateway(&forwarder, "_services._dns-sd._udp.local.").await,
+                ResponseCode::NXDomain,
+                "{cidr}"
+            );
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn reverse_names_map_to_the_block_they_describe() {
+        let block = |name: &str| reverse_block(&Name::from_ascii(name).unwrap());
+        let parse = |first: &str, last: &str| Some((first.parse().unwrap(), last.parse().unwrap()));
+        assert_eq!(
+            block("16.172.in-addr.arpa."),
+            parse("172.16.0.0", "172.16.255.255")
+        );
+        assert_eq!(block("4.3.2.1.in-addr.arpa."), parse("1.2.3.4", "1.2.3.4"));
+        assert_eq!(
+            block("b._dns-sd._udp.0.1.168.192.in-addr.arpa."),
+            parse("192.168.1.0", "192.168.1.0")
+        );
+        assert_eq!(
+            block("x.168.192.in-addr.arpa."),
+            parse("192.168.0.0", "192.168.255.255")
+        );
+        assert_eq!(
+            block("c.f.ip6.arpa."),
+            parse("fc00::", "fcff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")
+        );
+        assert_eq!(block("in-addr.arpa."), None);
+        assert_eq!(block("300.in-addr.arpa."), None);
+        assert_eq!(block("ff.ip6.arpa."), None);
+        assert_eq!(block("example.com."), None);
+    }
+
+    #[test]
+    fn multicast_zones_match_mdnsresponder() {
+        let multicast = |name: &str| is_multicast_zone_name(&Name::from_ascii(name).unwrap());
+        for name in [
+            "printer.LOCAL.",
+            "local.",
+            "db._dns-sd._udp.0.0.254.169.in-addr.arpa.",
+            "foo.254.169.in-addr.arpa.",
+            "_services._dns-sd._udp.8.e.f.ip6.arpa.",
+            "b.e.f.ip6.arpa.",
+        ] {
+            assert!(multicast(name), "{name}");
+        }
+        for name in [
+            "local.example.com.",
+            "169.in-addr.arpa.",
+            "e.f.ip6.arpa.",
+            "1.0.168.192.in-addr.arpa.",
+        ] {
+            assert!(!multicast(name), "{name}");
+        }
+    }
+
+    /// Reverse lookups are allowed exactly where the forward answer would
+    /// be: an allowed corporate range does not open a denied home LAN.
+    #[tokio::test]
+    async fn reverse_names_follow_the_addresses_they_name() {
+        let (upstream, hits) = responding_udp(Ipv4Addr::new(192, 0, 2, 7)).await;
+        let mut forwarder = forwarder_over(&[upstream]).await;
+        let forwarder_mut = Arc::get_mut(&mut forwarder).unwrap();
+        let mut policy = NetworkPolicy::from_profiles([NetworkProfile::Public]);
+        for (cidr, action) in [
+            ("192.168.0.0/16", Action::Deny),
+            ("10.0.0.0/8", Action::Allow),
+        ] {
+            policy.rules.push(Rule {
+                direction: crate::policy::Direction::Egress,
+                destination: Destination::Cidr(cidr.parse().unwrap()),
+                protocols: Vec::new(),
+                ports: Vec::new(),
+                action,
+            });
+        }
+        forwarder_mut.network_policy = Arc::new(policy);
+        forwarder_mut.config = Arc::new(NormalizedDnsConfig {
+            rebind_protection: true,
+            nameservers: Vec::new(),
+            query_timeout: Duration::from_millis(300),
+        });
+
+        assert_eq!(
+            resolve_name_via_gateway(&forwarder, "5.1.168.192.in-addr.arpa.").await,
+            ResponseCode::NXDomain
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            resolve_name_via_gateway(&forwarder, "5.1.0.10.in-addr.arpa.").await,
+            ResponseCode::NoError
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn local_network_names_resolve_with_local_network_access() {
+        let (upstream, hits) = responding_udp(Ipv4Addr::new(192, 168, 1, 20)).await;
+        let mut forwarder = forwarder_over(&[upstream]).await;
+        let forwarder_mut = Arc::get_mut(&mut forwarder).unwrap();
+        forwarder_mut.network_policy = Arc::new(NetworkPolicy::from_profiles([
+            NetworkProfile::Public,
+            NetworkProfile::Private,
+        ]));
+        forwarder_mut.config = Arc::new(NormalizedDnsConfig {
+            rebind_protection: true,
+            nameservers: Vec::new(),
+            query_timeout: Duration::from_millis(300),
+        });
+
+        assert_eq!(
+            resolve_name_via_gateway(&forwarder, "printer.local.").await,
+            ResponseCode::NoError
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// Disabling rebind protection also opts out of the local-network check.
+    #[tokio::test]
+    async fn local_network_names_resolve_without_rebind_protection() {
+        let (upstream, hits) = responding_udp(Ipv4Addr::new(192, 168, 1, 20)).await;
+        let forwarder = forwarder_over(&[upstream]).await;
+
+        assert_eq!(
+            resolve_name_via_gateway(&forwarder, "printer.local.").await,
+            ResponseCode::NoError
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

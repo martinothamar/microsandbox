@@ -94,6 +94,13 @@ By default, microsandbox resolves through the host's system resolver, so a runni
 - **macOS** asks mDNSResponder, the resolver macOS applications use, so VPN split DNS and `/etc/resolver` files apply, and `.local` names without a configured resolver use multicast DNS on the host's network. Responses include answer records only, and a missing name, or a lookup while the host has no reachable DNS server, gets an empty answer instead of `NXDOMAIN`.
 - **Windows** uses the Windows DNS Client.
 
+Some names describe the host's network, so the gateway answers them with `NXDOMAIN` unless the sandbox may reach it, or rebind protection is off:
+
+- Names under `.local` and the link-local reverse zones can be answered by multicast DNS. They resolve when rebind protection admits both the first and last address of a private or link-local range, as the `private` profile does. Rules for narrower ranges, such as a single subnet, do not count.
+- Reverse lookups of private or link-local addresses resolve when rebind protection admits the address, as it would for a forward answer.
+
+Forward names in a VPN's split-DNS zones resolve as they do on the host. Rebind protection filters their private addresses but not their other records, and a sandbox can tell a filtered name, answered with `NXDOMAIN`, from a missing one.
+
 Set `nameservers` when you need specific resolvers; they stay fixed for the sandbox's lifetime.
 
 Nameservers can be IP addresses, hostnames, or either form with a port. microsandbox resolves hostnames once when the sandbox starts.
