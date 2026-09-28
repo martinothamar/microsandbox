@@ -85,11 +85,11 @@ struct PendingQuery {
 //--------------------------------------------------------------------------------------------------
 
 impl SystemResolver {
-    pub(crate) async fn new(query_timeout: Duration) -> io::Result<Self> {
-        Ok(Self {
+    pub(crate) fn new(query_timeout: Duration) -> Self {
+        Self {
             query_timeout,
             raw_api: raw_dns_api(),
-        })
+        }
     }
 
     /// Resolve one gateway query through the Windows DNS Client.
@@ -366,7 +366,7 @@ mod tests {
             b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
             0x01,
         ];
-        let resolver = SystemResolver::new(Duration::from_secs(10)).await.unwrap();
+        let resolver = SystemResolver::new(Duration::from_secs(10));
         let response = resolver.query_raw(&query, Transport::Udp).await.unwrap();
         assert!(response.len() >= 12);
         assert_eq!(&response[..2], &[0x12, 0x34]);

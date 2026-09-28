@@ -753,7 +753,7 @@ DnsConfig(
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | rebind_protection | `bool` | `True` | Block DNS responses resolving to private IPs |
-| nameservers | `tuple[str, ...]` | `()` | Nameservers (`IP`, `IP:PORT`, `HOST`, or `HOST:PORT`). Overrides the host's `/etc/resolv.conf` when set. Hostnames are resolved once at startup via the host's OS resolver |
+| nameservers | `tuple[str, ...]` | `()` | Nameservers (`IP`, `IP:PORT`, `HOST`, or `HOST:PORT`). Replaces the host's system resolver when set. Hostnames are resolved once at startup via the host's OS resolver |
 | query_timeout_ms | `int \| None` | `None` | Per-DNS-query timeout in milliseconds. Defaults to `5000` |
 
 ### TlsConfig

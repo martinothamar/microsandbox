@@ -2,7 +2,7 @@
 //!
 //! Every platform module exports a `SystemResolver` with the same API:
 //!
-//! - `async fn new(query_timeout: Duration) -> io::Result<Self>`
+//! - `fn new(query_timeout: Duration) -> Self`
 //! - `async fn query(&self, query: &GatewayQuery<'_>) -> io::Result<Message>`
 //! - `fn check_proxy_resolution(&self) -> io::Result<()>`
 //!

@@ -88,7 +88,13 @@ msb create python --name safe-agent --net-default allow \
 
 <Tooltip tip="Custom nameservers are not available on microsandbox cloud. Cloud sandboxes use platform-managed DNS."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
 
-By default, microsandbox uses the host's resolver list. On Linux it uses the nameservers in `/etc/resolv.conf` and re-reads them when the file changes, so a running sandbox follows the host to a new network. Set `nameservers` when you need specific resolvers; they stay fixed for the sandbox's lifetime.
+By default, microsandbox resolves through the host's system resolver, so a running sandbox follows the host to a new network:
+
+- **Linux** uses the nameservers in `/etc/resolv.conf` and re-reads them when the file changes.
+- **macOS** asks mDNSResponder, the resolver macOS applications use, so VPN split DNS and `/etc/resolver` files apply, and `.local` names without a configured resolver use multicast DNS on the host's network. Responses include answer records only, and a missing name, or a lookup while the host has no reachable DNS server, gets an empty answer instead of `NXDOMAIN`.
+- **Windows** uses the Windows DNS Client.
+
+Set `nameservers` when you need specific resolvers; they stay fixed for the sandbox's lifetime.
 
 Nameservers can be IP addresses, hostnames, or either form with a port. microsandbox resolves hostnames once when the sandbox starts.
 

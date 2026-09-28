@@ -64,12 +64,8 @@ struct FileStamp {
 //--------------------------------------------------------------------------------------------------
 
 impl SystemResolver {
-    pub(crate) async fn new(query_timeout: Duration) -> io::Result<Self> {
-        Ok(Self::with_path(
-            Path::new(RESOLV_CONF_PATH),
-            DNS_PORT,
-            query_timeout,
-        ))
+    pub(crate) fn new(query_timeout: Duration) -> Self {
+        Self::with_path(Path::new(RESOLV_CONF_PATH), DNS_PORT, query_timeout)
     }
 
     /// Resolve one gateway query through the nameservers the file names now.

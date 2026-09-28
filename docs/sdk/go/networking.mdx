@@ -452,7 +452,7 @@ In-VM DNS proxy configuration.
 | Field | Type | Description |
 |-------|------|-------------|
 | RebindProtection | `*bool` | Block DNS responses resolving to private IPs. Defaults to `true` when unset |
-| Nameservers | `[]string` | Upstream resolvers (e.g. `"1.1.1.1:53"`). Replaces `/etc/resolv.conf` when non-empty |
+| Nameservers | `[]string` | Upstream resolvers (e.g. `"1.1.1.1:53"`). Replaces the host's system resolver when non-empty |
 | QueryTimeoutMs | `*uint64` | Per-DNS-query timeout in milliseconds |
 
 ### TLSConfig

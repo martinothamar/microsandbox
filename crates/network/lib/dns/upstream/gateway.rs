@@ -43,9 +43,7 @@ impl Upstream {
     /// are configured, otherwise the host's system resolver.
     pub(crate) async fn from_config(config: &NormalizedDnsConfig) -> io::Result<Self> {
         if config.nameservers.is_empty() {
-            return SystemResolver::new(config.query_timeout)
-                .await
-                .map(Self::System);
+            return Ok(Self::System(SystemResolver::new(config.query_timeout)));
         }
 
         let servers = resolve_nameservers(&config.nameservers).await?;
