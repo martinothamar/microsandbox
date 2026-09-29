@@ -4064,7 +4064,6 @@ version = "0.6.18-digdir.3"
 dependencies = [
  "base64 0.22.1",
  "bytes",
- "core-foundation 0.9.4",
  "crossbeam-queue",
  "dirs",
  "futures",
@@ -4092,7 +4091,6 @@ dependencies = [
  "serde_json",
  "smoltcp",
  "socket2",
- "system-configuration",
  "thiserror 2.0.20",
  "time",
  "tokio",

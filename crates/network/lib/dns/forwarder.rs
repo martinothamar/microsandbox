@@ -26,28 +26,24 @@
 
 use std::collections::HashSet;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::StreamExt;
-use hickory_net::proto::op::{DnsRequest, Edns, Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_net::proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_net::proto::rr::rdata::{A, AAAA, CNAME};
 use hickory_net::proto::rr::{Name, RData, Record, RecordType};
 use hickory_net::proto::serialize::binary::{BinDecodable, BinEncodable};
-use hickory_net::xfer::DnsHandle;
-use tokio::sync::{OnceCell, watch};
+use tokio::sync::watch;
 
-use super::client::{Client, build_direct_client, build_tcp_client, build_udp_client};
+use super::client::{Client, build_direct_client, send_query};
 use super::common::config::NormalizedDnsConfig;
 use super::common::filter::{is_private_ipv4, is_private_ipv6};
 use super::common::transport::Transport;
-#[cfg(not(windows))]
-use super::nameserver::read_host_dns_servers;
-use super::nameserver::resolve_nameservers;
-#[cfg(windows)]
-use super::windows_resolver::WindowsSystemResolver;
+#[cfg(test)]
+use super::upstream::PinnedUpstreams;
+use super::upstream::{GatewayQuery, Upstream};
 use crate::control::{
     NetworkControlClient, NetworkOperation, TransportProtocol, wait_for_revocation,
 };
@@ -75,6 +71,43 @@ const RESOLVED_HOSTNAME_MIN_TTL_SECS: u32 = 1;
 /// the forwarder on each connection.
 const HOST_ALIAS_TTL_SECS: u32 = 60;
 
+/// Local-network address ranges as first and last address: RFC 1918,
+/// CGN, IPv4 link-local, ULA and IPv6 link-local.
+const LOCAL_NETWORK_RANGES: [(IpAddr, IpAddr); 7] = [
+    (
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)),
+        IpAddr::V4(Ipv4Addr::new(10, 255, 255, 255)),
+    ),
+    (
+        IpAddr::V4(Ipv4Addr::new(172, 16, 0, 0)),
+        IpAddr::V4(Ipv4Addr::new(172, 31, 255, 255)),
+    ),
+    (
+        IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)),
+        IpAddr::V4(Ipv4Addr::new(192, 168, 255, 255)),
+    ),
+    (
+        IpAddr::V4(Ipv4Addr::new(100, 64, 0, 0)),
+        IpAddr::V4(Ipv4Addr::new(100, 127, 255, 255)),
+    ),
+    (
+        IpAddr::V4(Ipv4Addr::new(169, 254, 0, 0)),
+        IpAddr::V4(Ipv4Addr::new(169, 254, 255, 255)),
+    ),
+    (
+        IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0)),
+        IpAddr::V6(Ipv6Addr::new(
+            0xfdff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+        )),
+    ),
+    (
+        IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0)),
+        IpAddr::V6(Ipv6Addr::new(
+            0xfebf, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+        )),
+    ),
+];
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -92,10 +125,9 @@ pub(crate) type DnsForwarderHandle = watch::Receiver<Option<Arc<DnsForwarder>>>;
 /// network policy, and normalized DNS config. Cheaply cloneable via
 /// `Arc`.
 pub(crate) struct DnsForwarder {
-    /// Resolver used when the guest queries the gateway IP. Explicitly configured nameservers use
-    /// direct clients; on Windows, host-default queries use the system DNS Client so interface,
-    /// VPN, NRPT and resolver-health policy remains owned by the operating system.
-    configured: ConfiguredResolver,
+    /// Resolver used when the guest queries the gateway IP: explicitly configured nameservers,
+    /// or the host's system resolver.
+    upstream: Upstream,
     /// Set of gateway IPs (v4 + v6). Queries to these IPs go through
     /// the configured upstream; queries to other IPs go through the
     /// direct path subject to network egress policy.
@@ -118,31 +150,6 @@ pub(crate) struct DnsForwarder {
     config: Arc<NormalizedDnsConfig>,
     /// Host authorization endpoint selected for controlled networking.
     controller: Option<NetworkControlClient>,
-}
-
-/// One configured upstream and its per-transport clients.
-struct ConfiguredUpstream {
-    /// SocketAddr of this upstream — needed to build `tcp` on demand
-    /// and for diagnostic logging.
-    addr: SocketAddr,
-    /// UDP client, connected at startup. Cheap to build for every
-    /// upstream: since hickory 0.26 the constructor only wraps a
-    /// request sender, so socket errors surface per-query instead.
-    udp: Client,
-    /// Lazy TCP client. Built on first TCP query that reaches this
-    /// upstream; many sandboxes never use TCP DNS at all, so we don't
-    /// pay the handshake cost up front.
-    tcp: OnceCell<Client>,
-}
-
-/// Backend for queries addressed to the sandbox gateway.
-enum ConfiguredResolver {
-    /// Direct upstreams, tried in order. This covers operator-configured nameservers on every host
-    /// and host-discovered nameservers on Unix.
-    Direct(Vec<ConfiguredUpstream>),
-    /// Native Windows DNS Client used only when no nameserver was explicitly configured.
-    #[cfg(windows)]
-    WindowsSystem(WindowsSystemResolver),
 }
 
 /// Outcome of upstream selection. The query may be forwarded through
@@ -202,13 +209,7 @@ impl DnsForwarder {
     /// rebind protection, active guest address families, and the guest DNS
     /// cache do not apply here.
     pub(crate) async fn resolve_proxy_domain(&self, domain: &str) -> io::Result<Vec<IpAddr>> {
-        #[cfg(windows)]
-        if matches!(&self.configured, ConfiguredResolver::WindowsSystem(_)) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "proxy relay domain resolution requires an explicit DNS nameserver on Windows",
-            ));
-        }
+        self.upstream.check_proxy_resolution()?;
 
         let name = Name::from_ascii(domain).map_err(|error| {
             io::Error::new(
@@ -260,11 +261,8 @@ impl DnsForwarder {
         edns.set_max_payload(4096);
         query.edns = Some(edns);
 
-        let raw_query = query
-            .to_bytes()
-            .map_err(|error| io::Error::other(format!("failed to encode DNS query: {error}")))?;
         let response = self
-            .forward_to_configured(&raw_query, &query, domain, Transport::Udp)
+            .query_upstream(&query, domain, Transport::Udp)
             .await
             .ok_or_else(|| io::Error::other("proxy relay DNS query failed"))?;
 
@@ -290,6 +288,16 @@ impl DnsForwarder {
         let query_type = question.query_type();
         let domain = question.name().to_string();
         let domain = domain.trim_end_matches('.').to_owned();
+
+        // Policy compares names as sent, but a system resolver may map
+        // non-ASCII labels to ASCII before resolving (mDNSResponder applies
+        // UTS46, turning fullwidth `ｌｏｃａｌ` into `local`), so such a
+        // name could slip past domain rules and the local-network check.
+        // Clients send internationalized names as ASCII punycode.
+        if !question.name().iter().flatten().all(u8::is_ascii) {
+            tracing::debug!(domain = %domain, "DNS name with non-ASCII bytes refused");
+            return build_status_response(&query_msg, ResponseCode::NXDomain);
+        }
 
         // Refuse queries denied by the network policy. DNS is evaluated
         // as egress over the guest-facing DNS transport, so deny-by-
@@ -322,6 +330,17 @@ impl DnsForwarder {
                 synthesize_host_alias_response(&query_msg, self.gateway, query_type)
         {
             return Some(response);
+        }
+
+        // Local-network names describe the host's network: names in the
+        // multicast zones can reach multicast DNS, and reverse names of
+        // private addresses map internal hosts. Rebind protection only
+        // filters address records, so without this their PTR, SRV and TXT
+        // answers would reach a sandbox that may not reach that network.
+        let to_gateway = original_dst.is_none_or(|dst| self.gateway_ips.contains(&dst));
+        if to_gateway && !self.may_resolve_local_network_name(question.name()) {
+            tracing::debug!(domain = %domain, "local-network DNS name refused by network policy");
+            return build_status_response(&query_msg, ResponseCode::NXDomain);
         }
 
         // Controlled networking authorizes the query before any upstream is
@@ -364,11 +383,11 @@ impl DnsForwarder {
                 UpstreamChoice::PolicyDenied => Err(()),
                 UpstreamChoice::ServFail => Ok(None),
                 UpstreamChoice::Direct(client) => {
-                    Ok(self.send_query(&client, &query_msg, &domain).await)
+                    Ok(send_query(&client, &query_msg, &domain).await)
                 }
-                UpstreamChoice::Configured => Ok(self
-                    .forward_to_configured(raw_query, &query_msg, &domain, transport)
-                    .await),
+                UpstreamChoice::Configured => {
+                    Ok(self.query_upstream(&query_msg, &domain, transport).await)
+                }
             }
         };
         let response = tokio::select! {
@@ -490,121 +509,52 @@ impl DnsForwarder {
         }
     }
 
-    /// Forward a query to the configured upstreams, in order, stopping
-    /// at the first that answers. Falls over on per-query timeout or
-    /// transport failure, which is the whole point: the guest holds the
-    /// gateway as its only nameserver and cannot try the rest itself.
-    /// `None` when every upstream is unusable.
-    async fn forward_to_configured(
+    /// Whether this sandbox may resolve `name` if it describes the local
+    /// network. A multicast-zone name needs the sandbox to reach some local
+    /// range; a reverse name of a local address needs rebind protection to
+    /// admit that address, or the whole block a shorter prefix names.
+    fn may_resolve_local_network_name(&self, name: &Name) -> bool {
+        if !self.config.rebind_protection {
+            return true;
+        }
+        let multicast_allowed = !is_multicast_zone_name(name)
+            || LOCAL_NETWORK_RANGES
+                .iter()
+                .any(|&(first, last)| self.admits(first) && self.admits(last));
+        let reverse_allowed = reverse_block(name).is_none_or(|(first, last)| {
+            !is_in_local_network_range(first) || (self.admits(first) && self.admits(last))
+        });
+        multicast_allowed && reverse_allowed
+    }
+
+    /// Whether rebind protection admits `addr` as an answer.
+    fn admits(&self, addr: IpAddr) -> bool {
+        policies_allow_rebind_address(
+            &self.network_policy,
+            self.platform_policy.as_deref(),
+            &self.shared,
+            addr,
+        )
+    }
+
+    /// Resolve a gateway-addressed query through the upstream. `None`
+    /// when no usable answer was obtained.
+    async fn query_upstream(
         &self,
-        _raw_query: &[u8],
         query_msg: &Message,
         domain: &str,
         transport: Transport,
     ) -> Option<Message> {
-        match &self.configured {
-            ConfiguredResolver::Direct(upstreams) => {
-                let total = upstreams.len();
-                for (index, upstream) in upstreams.iter().enumerate() {
-                    let Some(client) = self.client_for(upstream, transport).await else {
-                        continue;
-                    };
-                    if let Some(response) = self.send_query(&client, query_msg, domain).await {
-                        return Some(response);
-                    }
-                    if index + 1 < total {
-                        tracing::debug!(
-                            domain = %domain,
-                            upstream = %upstream.addr,
-                            "upstream DNS unusable, trying next configured nameserver",
-                        );
-                    }
-                }
+        let query = GatewayQuery {
+            message: query_msg,
+            domain,
+            transport,
+        };
+        match self.upstream.query(&query).await {
+            Ok(response) => Some(response),
+            Err(error) => {
+                tracing::warn!(domain = %domain, %error, "gateway DNS query failed");
                 None
-            }
-            #[cfg(windows)]
-            ConfiguredResolver::WindowsSystem(resolver) => {
-                match resolver.query(_raw_query, transport).await {
-                    Ok(response) => match Message::from_bytes(&response) {
-                        Ok(response) => Some(response),
-                        Err(error) => {
-                            tracing::warn!(
-                                domain = %domain,
-                                error = %error,
-                                "Windows system DNS returned an invalid response",
-                            );
-                            None
-                        }
-                    },
-                    Err(error) => {
-                        tracing::warn!(
-                            domain = %domain,
-                            error = %error,
-                            "Windows system DNS query failed",
-                        );
-                        None
-                    }
-                }
-            }
-        }
-    }
-
-    /// Send one query to one upstream. `None` means this upstream did
-    /// not produce a usable answer, which is what makes the caller fall
-    /// over to the next one: a per-query timeout and a transport error
-    /// both arrive as `Some(Err)`, and a closed stream as `None`.
-    ///
-    /// A response that *arrives* is returned as-is even when it carries
-    /// SERVFAIL or REFUSED. That is an answer from a working resolver,
-    /// not an unusable server, and re-asking the next one would change
-    /// what the sandbox resolves rather than just repairing reachability.
-    async fn send_query(
-        &self,
-        client: &Client,
-        query_msg: &Message,
-        domain: &str,
-    ) -> Option<Message> {
-        let mut send = client.send(DnsRequest::from(query_msg.clone()));
-        match send.next().await {
-            Some(Ok(resp)) => Some(resp.into()),
-            Some(Err(e)) => {
-                tracing::warn!(domain = %domain, error = %e, "upstream DNS send failed");
-                None
-            }
-            None => {
-                tracing::warn!(domain = %domain, "upstream DNS closed stream without a response");
-                None
-            }
-        }
-    }
-
-    /// Get the client for one configured upstream on `transport`. UDP
-    /// is shared (pre-connected at startup); TCP is built on first use
-    /// and cached per upstream. DoT guests reuse the TCP client — the
-    /// configured upstream is typically on the host's loopback or
-    /// internal network and serves plain DNS, so re-TLSing there is
-    /// overkill.
-    ///
-    /// Called per upstream as the query walks the list, so an upstream
-    /// that is never reached never pays for a TCP handshake.
-    async fn client_for(
-        &self,
-        upstream: &ConfiguredUpstream,
-        transport: Transport,
-    ) -> Option<Client> {
-        match transport {
-            Transport::Udp => Some(upstream.udp.clone()),
-            Transport::Tcp | Transport::Dot => {
-                let timeout = self.config.query_timeout;
-                let addr = upstream.addr;
-                upstream
-                    .tcp
-                    .get_or_try_init(
-                        || async move { build_tcp_client(addr, timeout).await.ok_or(()) },
-                    )
-                    .await
-                    .ok()
-                    .cloned()
             }
         }
     }
@@ -663,48 +613,16 @@ impl DnsForwarder {
         gateway: GatewayIps,
         controller: Option<NetworkControlClient>,
     ) -> Option<Arc<Self>> {
-        let configured = if !config.nameservers.is_empty() {
-            match resolve_nameservers(&config.nameservers).await {
-                Ok(upstreams) if !upstreams.is_empty() => ConfiguredResolver::Direct(
-                    Self::build_direct_upstreams(upstreams, config.query_timeout).await?,
-                ),
-                Ok(_) => {
-                    tracing::error!("no configured nameservers resolved to an address");
-                    return None;
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to resolve configured nameservers");
-                    return None;
-                }
+        let upstream = match Upstream::from_config(&config).await {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                tracing::error!(%error, "failed to initialize the DNS upstream");
+                return None;
             }
-        } else if cfg!(windows) {
-            #[cfg(windows)]
-            {
-                ConfiguredResolver::WindowsSystem(WindowsSystemResolver::new(config.query_timeout))
-            }
-            #[cfg(not(windows))]
-            unreachable!()
-        } else {
-            #[cfg(not(windows))]
-            match read_host_dns_servers().await {
-                Ok(upstreams) if !upstreams.is_empty() => ConfiguredResolver::Direct(
-                    Self::build_direct_upstreams(upstreams, config.query_timeout).await?,
-                ),
-                Ok(_) => {
-                    tracing::error!("no upstream DNS servers discovered from host");
-                    return None;
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to read host DNS configuration");
-                    return None;
-                }
-            }
-            #[cfg(windows)]
-            unreachable!()
         };
 
         Some(Arc::new(Self {
-            configured,
+            upstream,
             gateway_ips,
             network_policy,
             platform_policy,
@@ -713,30 +631,6 @@ impl DnsForwarder {
             config,
             controller,
         }))
-    }
-
-    /// Build every direct upstream so the gateway path can fall over when one is unreachable.
-    async fn build_direct_upstreams(
-        upstreams: Vec<SocketAddr>,
-        query_timeout: Duration,
-    ) -> Option<Vec<ConfiguredUpstream>> {
-        let mut configured = Vec::with_capacity(upstreams.len());
-        for addr in upstreams {
-            let Some(udp) = build_udp_client(addr, query_timeout).await else {
-                tracing::warn!(upstream = %addr, "skipping upstream: failed to build UDP client");
-                continue;
-            };
-            configured.push(ConfiguredUpstream {
-                addr,
-                udp,
-                tcp: OnceCell::new(),
-            });
-        }
-        if configured.is_empty() {
-            tracing::error!("no upstream DNS client could be built");
-            return None;
-        }
-        Some(configured)
     }
 
     /// Wait until the forwarder cell is populated, then return a
@@ -766,9 +660,7 @@ impl DnsForwarder {
             crate::config::DnsConfig::default(),
         ));
         let upstream = upstream.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 9)));
-        let udp = build_udp_client(upstream, config.query_timeout)
-            .await
-            .expect("test UDP client should initialize");
+        let upstream = PinnedUpstreams::new(vec![upstream], config.query_timeout);
         let gateway_ips = Arc::new(
             gateway
                 .ipv4
@@ -779,11 +671,7 @@ impl DnsForwarder {
         );
 
         Arc::new(Self {
-            configured: ConfiguredResolver::Direct(vec![ConfiguredUpstream {
-                addr: upstream,
-                udp,
-                tcp: OnceCell::new(),
-            }]),
+            upstream: Upstream::Pinned(upstream),
             gateway_ips,
             network_policy: Arc::new(NetworkPolicy::allow_all()),
             platform_policy: None,
@@ -1011,6 +899,91 @@ fn normalize_dns_name(name: &str) -> String {
     name.trim_end_matches('.').to_ascii_lowercase()
 }
 
+/// Zones mDNSResponder resolves by multicast DNS (its `IsLocalDomain`),
+/// labels from the right.
+const MULTICAST_ZONES: [&[&[u8]]; 6] = [
+    &[b"local"],
+    &[b"arpa", b"in-addr", b"169", b"254"],
+    &[b"arpa", b"ip6", b"f", b"e", b"8"],
+    &[b"arpa", b"ip6", b"f", b"e", b"9"],
+    &[b"arpa", b"ip6", b"f", b"e", b"a"],
+    &[b"arpa", b"ip6", b"f", b"e", b"b"],
+];
+
+/// Whether `name` is in one of the [`MULTICAST_ZONES`], case-insensitively.
+fn is_multicast_zone_name(name: &Name) -> bool {
+    MULTICAST_ZONES.iter().any(|zone| {
+        usize::from(name.num_labels()) >= zone.len()
+            && name
+                .iter()
+                .rev()
+                .zip(zone.iter())
+                .all(|(label, zone_label)| label.eq_ignore_ascii_case(zone_label))
+    })
+}
+
+/// The first and last address of the block a reverse name describes: the
+/// address labels next to `in-addr.arpa` or `ip6.arpa`, up to the first
+/// label that is not part of an address, as in DNS-SD browse names.
+fn reverse_block(name: &Name) -> Option<(IpAddr, IpAddr)> {
+    let labels: Vec<&[u8]> = name.iter().rev().collect();
+    match labels.as_slice() {
+        [arpa, in_addr, rest @ ..]
+            if arpa.eq_ignore_ascii_case(b"arpa") && in_addr.eq_ignore_ascii_case(b"in-addr") =>
+        {
+            let octets: Vec<u8> = rest
+                .iter()
+                .take(4)
+                .map_while(|label| std::str::from_utf8(label).ok()?.parse().ok())
+                .collect();
+            let bits = u32::try_from(octets.len() * 8).ok()?;
+            let mut first = [0u8; 4];
+            first[..octets.len()].copy_from_slice(&octets);
+            let first = u32::from_be_bytes(first);
+            let last = first | u32::MAX.checked_shr(bits).unwrap_or(0);
+            (bits > 0).then(|| {
+                (
+                    IpAddr::V4(Ipv4Addr::from(first)),
+                    IpAddr::V4(Ipv4Addr::from(last)),
+                )
+            })
+        }
+        [arpa, ip6, rest @ ..]
+            if arpa.eq_ignore_ascii_case(b"arpa") && ip6.eq_ignore_ascii_case(b"ip6") =>
+        {
+            let nibbles: Vec<u32> = rest
+                .iter()
+                .take(32)
+                .map_while(|label| match label {
+                    [nibble] => char::from(*nibble).to_digit(16),
+                    _ => None,
+                })
+                .collect();
+            let bits = u32::try_from(nibbles.len() * 4).ok()?;
+            let first = nibbles
+                .iter()
+                .enumerate()
+                .fold(0u128, |acc, (index, &nibble)| {
+                    acc | u128::from(nibble) << (124 - 4 * index)
+                });
+            let last = first | u128::MAX.checked_shr(bits).unwrap_or(0);
+            (bits > 0).then(|| {
+                (
+                    IpAddr::V6(Ipv6Addr::from(first)),
+                    IpAddr::V6(Ipv6Addr::from(last)),
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
+fn is_in_local_network_range(addr: IpAddr) -> bool {
+    LOCAL_NETWORK_RANGES
+        .iter()
+        .any(|&(first, last)| first <= addr && addr <= last)
+}
+
 /// Case-insensitive match against [`crate::HOST_ALIAS`] with trailing-dot tolerance.
 fn is_host_alias_query(query_name: &str) -> bool {
     query_name
@@ -1145,19 +1118,10 @@ mod tests {
             nameservers: Vec::new(),
             query_timeout: Duration::from_millis(300),
         });
-        let mut configured = Vec::new();
-        for addr in upstreams {
-            configured.push(ConfiguredUpstream {
-                addr: *addr,
-                udp: build_udp_client(*addr, config.query_timeout)
-                    .await
-                    .expect("udp client"),
-                tcp: OnceCell::new(),
-            });
-        }
+        let upstream = PinnedUpstreams::new(upstreams.to_vec(), config.query_timeout);
         let gateway_ip: IpAddr = "10.0.0.1".parse().unwrap();
         Arc::new(DnsForwarder {
-            configured: ConfiguredResolver::Direct(configured),
+            upstream: Upstream::Pinned(upstream),
             gateway_ips: Arc::new(HashSet::from([gateway_ip])),
             network_policy: Arc::new(NetworkPolicy::from_profiles([NetworkProfile::Public])),
             platform_policy: None,
@@ -1278,6 +1242,264 @@ mod tests {
             .unwrap()
             .expect("a revoked query gets a synthetic answer");
         assert_eq!(response_code(&response), ResponseCode::NXDomain);
+    }
+
+    async fn resolve_name_via_gateway(forwarder: &DnsForwarder, name: &str) -> ResponseCode {
+        let raw = make_query(name, RecordType::PTR)
+            .to_bytes()
+            .expect("encode query");
+        let gateway: IpAddr = "10.0.0.1".parse().unwrap();
+        let bytes = forwarder
+            .forward(&raw, Some(gateway), Transport::Udp, None)
+            .await
+            .expect("a response");
+        response_code(&bytes)
+    }
+
+    /// A sandbox limited to public egress must not learn about the host's
+    /// local network through multicast DNS or private reverse lookups.
+    #[tokio::test]
+    async fn local_network_names_are_refused_without_local_network_access() {
+        let (upstream, hits) = responding_udp(Ipv4Addr::new(192, 0, 2, 7)).await;
+        let mut forwarder = forwarder_over(&[upstream]).await;
+        Arc::get_mut(&mut forwarder).unwrap().config = Arc::new(NormalizedDnsConfig {
+            rebind_protection: true,
+            nameservers: Vec::new(),
+            query_timeout: Duration::from_millis(300),
+        });
+
+        for name in [
+            "_services._dns-sd._udp.local.",
+            "Printer.LOCAL.",
+            "1.0.254.169.in-addr.arpa.",
+            "1.0.0.0.0.0.0.0.0.0.0.0.0.0.8.e.f.ip6.arpa.",
+            "4.3.2.10.in-addr.arpa.",
+            "10.in-addr.arpa.",
+            "1.0.16.172.in-addr.arpa.",
+            "1.0.168.192.in-addr.arpa.",
+            "1.2.64.100.in-addr.arpa.",
+            "1.0.0.0.d.f.ip6.arpa.",
+            "db._dns-sd._udp.0.0.254.169.in-addr.arpa.",
+            "x.1.0.254.169.in-addr.arpa.",
+            "_services._dns-sd._udp.8.e.f.ip6.arpa.",
+            "b._dns-sd._udp.0.1.168.192.in-addr.arpa.",
+        ] {
+            assert_eq!(
+                resolve_name_via_gateway(&forwarder, name).await,
+                ResponseCode::NXDomain,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "no query reaches the upstream"
+        );
+
+        for name in [
+            "local.example.com.",
+            "8.8.8.8.in-addr.arpa.",
+            "1.1.1.172.in-addr.arpa.",
+            "172.in-addr.arpa.",
+            "1.0.0.2.ip6.arpa.",
+        ] {
+            resolve_name_via_gateway(&forwarder, name).await;
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 5, "other names still resolve");
+    }
+
+    /// Only a whole local range opens the gate: a rule for one subnet or
+    /// host must not expose the rest of the host's network.
+    #[tokio::test]
+    async fn narrow_local_rules_do_not_open_the_local_network_gate() {
+        let (upstream, hits) = responding_udp(Ipv4Addr::new(192, 168, 0, 20)).await;
+        for cidr in ["192.168.0.1/32", "192.168.0.0/24", "10.0.0.0/16"] {
+            let mut forwarder = forwarder_over(&[upstream]).await;
+            let forwarder_mut = Arc::get_mut(&mut forwarder).unwrap();
+            let mut policy = NetworkPolicy::from_profiles([NetworkProfile::Public]);
+            policy.rules.push(Rule {
+                direction: crate::policy::Direction::Egress,
+                destination: Destination::Cidr(cidr.parse().unwrap()),
+                protocols: Vec::new(),
+                ports: Vec::new(),
+                action: Action::Allow,
+            });
+            forwarder_mut.network_policy = Arc::new(policy);
+            forwarder_mut.config = Arc::new(NormalizedDnsConfig {
+                rebind_protection: true,
+                nameservers: Vec::new(),
+                query_timeout: Duration::from_millis(300),
+            });
+            assert_eq!(
+                resolve_name_via_gateway(&forwarder, "_services._dns-sd._udp.local.").await,
+                ResponseCode::NXDomain,
+                "{cidr}"
+            );
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn reverse_names_map_to_the_block_they_describe() {
+        let block = |name: &str| reverse_block(&Name::from_ascii(name).unwrap());
+        let parse = |first: &str, last: &str| Some((first.parse().unwrap(), last.parse().unwrap()));
+        assert_eq!(
+            block("16.172.in-addr.arpa."),
+            parse("172.16.0.0", "172.16.255.255")
+        );
+        assert_eq!(block("4.3.2.1.in-addr.arpa."), parse("1.2.3.4", "1.2.3.4"));
+        assert_eq!(
+            block("b._dns-sd._udp.0.1.168.192.in-addr.arpa."),
+            parse("192.168.1.0", "192.168.1.0")
+        );
+        assert_eq!(
+            block("x.168.192.in-addr.arpa."),
+            parse("192.168.0.0", "192.168.255.255")
+        );
+        assert_eq!(
+            block("c.f.ip6.arpa."),
+            parse("fc00::", "fcff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")
+        );
+        assert_eq!(block("in-addr.arpa."), None);
+        assert_eq!(block("300.in-addr.arpa."), None);
+        assert_eq!(block("ff.ip6.arpa."), None);
+        assert_eq!(block("example.com."), None);
+    }
+
+    #[test]
+    fn multicast_zones_match_mdnsresponder() {
+        let multicast = |name: &str| is_multicast_zone_name(&Name::from_ascii(name).unwrap());
+        for name in [
+            "printer.LOCAL.",
+            "local.",
+            "db._dns-sd._udp.0.0.254.169.in-addr.arpa.",
+            "foo.254.169.in-addr.arpa.",
+            "_services._dns-sd._udp.8.e.f.ip6.arpa.",
+            "b.e.f.ip6.arpa.",
+        ] {
+            assert!(multicast(name), "{name}");
+        }
+        for name in [
+            "local.example.com.",
+            "169.in-addr.arpa.",
+            "e.f.ip6.arpa.",
+            "1.0.168.192.in-addr.arpa.",
+        ] {
+            assert!(!multicast(name), "{name}");
+        }
+    }
+
+    /// Reverse lookups are allowed exactly where the forward answer would
+    /// be: an allowed corporate range does not open a denied home LAN.
+    #[tokio::test]
+    async fn reverse_names_follow_the_addresses_they_name() {
+        let (upstream, hits) = responding_udp(Ipv4Addr::new(192, 0, 2, 7)).await;
+        let mut forwarder = forwarder_over(&[upstream]).await;
+        let forwarder_mut = Arc::get_mut(&mut forwarder).unwrap();
+        let mut policy = NetworkPolicy::from_profiles([NetworkProfile::Public]);
+        for (cidr, action) in [
+            ("192.168.0.0/16", Action::Deny),
+            ("10.0.0.0/8", Action::Allow),
+        ] {
+            policy.rules.push(Rule {
+                direction: crate::policy::Direction::Egress,
+                destination: Destination::Cidr(cidr.parse().unwrap()),
+                protocols: Vec::new(),
+                ports: Vec::new(),
+                action,
+            });
+        }
+        forwarder_mut.network_policy = Arc::new(policy);
+        forwarder_mut.config = Arc::new(NormalizedDnsConfig {
+            rebind_protection: true,
+            nameservers: Vec::new(),
+            query_timeout: Duration::from_millis(300),
+        });
+
+        assert_eq!(
+            resolve_name_via_gateway(&forwarder, "5.1.168.192.in-addr.arpa.").await,
+            ResponseCode::NXDomain
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            resolve_name_via_gateway(&forwarder, "5.1.0.10.in-addr.arpa.").await,
+            ResponseCode::NoError
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn local_network_names_resolve_with_local_network_access() {
+        let (upstream, hits) = responding_udp(Ipv4Addr::new(192, 168, 1, 20)).await;
+        let mut forwarder = forwarder_over(&[upstream]).await;
+        let forwarder_mut = Arc::get_mut(&mut forwarder).unwrap();
+        forwarder_mut.network_policy = Arc::new(NetworkPolicy::from_profiles([
+            NetworkProfile::Public,
+            NetworkProfile::Private,
+        ]));
+        forwarder_mut.config = Arc::new(NormalizedDnsConfig {
+            rebind_protection: true,
+            nameservers: Vec::new(),
+            query_timeout: Duration::from_millis(300),
+        });
+
+        assert_eq!(
+            resolve_name_via_gateway(&forwarder, "printer.local.").await,
+            ResponseCode::NoError
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// Names a system resolver could map to other ASCII names are refused
+    /// before policy sees them; punycode passes through.
+    #[tokio::test]
+    async fn non_ascii_names_are_refused() {
+        let (upstream, hits) = responding_udp(Ipv4Addr::new(192, 0, 2, 7)).await;
+        let forwarder = forwarder_over(&[upstream]).await;
+        let gateway: IpAddr = "10.0.0.1".parse().unwrap();
+
+        for labels in [
+            vec!["_services", "_dns-sd", "_udp", "ｌｏｃａｌ"],
+            vec!["evil", "ｃｏｍ"],
+            vec!["ｅｖｉｌ", "com"],
+        ] {
+            let mut query = Message::new(0x4242, MessageType::Query, OpCode::Query);
+            let name = Name::from_labels(labels.iter().map(|label| label.as_bytes())).unwrap();
+            query.add_query(Query::query(name, RecordType::A));
+            let bytes = forwarder
+                .forward(
+                    &query.to_bytes().unwrap(),
+                    Some(gateway),
+                    Transport::Udp,
+                    None,
+                )
+                .await
+                .expect("a response");
+            assert_eq!(response_code(&bytes), ResponseCode::NXDomain, "{labels:?}");
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "no query reaches the upstream"
+        );
+
+        assert_eq!(
+            resolve_name_via_gateway(&forwarder, "xn--bcher-kva.example.").await,
+            ResponseCode::NoError
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// Disabling rebind protection also opts out of the local-network check.
+    #[tokio::test]
+    async fn local_network_names_resolve_without_rebind_protection() {
+        let (upstream, hits) = responding_udp(Ipv4Addr::new(192, 168, 1, 20)).await;
+        let forwarder = forwarder_over(&[upstream]).await;
+
+        assert_eq!(
+            resolve_name_via_gateway(&forwarder, "printer.local.").await,
+            ResponseCode::NoError
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

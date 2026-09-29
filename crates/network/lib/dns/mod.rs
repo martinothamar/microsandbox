@@ -24,10 +24,9 @@ pub(crate) mod common;
 pub mod interceptor;
 pub mod nameserver;
 pub(crate) mod proxies;
-#[cfg(windows)]
-pub(crate) mod windows_resolver;
 
 mod client;
 pub(crate) mod forwarder;
+mod upstream;
 
 pub use nameserver::{Nameserver, ParseNameserverError};
