@@ -203,7 +203,7 @@ fn import_prepared_root_blocking(
         })?;
         let artifact_digest = parse_digest(&metadata.root.artifact_digest, "flat artifact digest")?;
         cache.publish_flat_blob(&candidate, &artifact_digest, actual_size)?;
-        cache.write_flat_ref(&manifest_digest, &metadata.root)?;
+        cache.replace_flat_ref(&manifest_digest, &metadata.root)?;
     }
 
     cache.write_image_metadata(reference, &metadata.image)?;

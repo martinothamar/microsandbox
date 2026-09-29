@@ -1,5 +1,6 @@
 //! Global on-disk image and layer cache.
 
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -60,6 +61,9 @@ const EROFS_ALIGNMENT_BYTES: u64 = 4096;
 /// ~/.microsandbox/cache/fsmeta/<manifest_safe>.erofs.lock    # materialization flock
 /// ~/.microsandbox/cache/vmdk/<manifest_safe>.vmdk            # VMDK descriptor
 /// ~/.microsandbox/cache/vmdk/<manifest_safe>.vmdk.lock       # materialization flock
+/// ~/.microsandbox/cache/flat/refs/<manifest_safe>.json       # flat rootfs ref
+/// ~/.microsandbox/cache/flat/blobs/<artifact_safe>.raw       # flat ext4 artifact
+/// ~/.microsandbox/cache/flat/locks/<derivation_safe>.lock    # materialization flock
 /// ```
 #[derive(Clone)]
 pub struct GlobalCache {
@@ -438,6 +442,108 @@ impl GlobalCache {
         Ok(())
     }
 
+    /// Replace a flat rootfs reference, then remove the blob the previous reference named
+    /// when no other reference names it.
+    pub(crate) fn replace_flat_ref(
+        &self,
+        manifest_digest: &Digest,
+        reference: &FlatRootfsRef,
+    ) -> ImageResult<()> {
+        // Cleanup is best-effort and must never fail publication.
+        let previous =
+            read_flat_ref_artifact(&self.flat_ref_path(manifest_digest)).unwrap_or_else(|error| {
+                tracing::warn!(%error, "failed to read the replaced flat rootfs ref");
+                None
+            });
+        self.write_flat_ref(manifest_digest, reference)?;
+        if let Some(previous) = previous
+            && previous.to_string() != reference.artifact_digest
+            && let Err(error) = self.remove_unnamed_flat_blobs(&[previous], &HashSet::new())
+        {
+            tracing::warn!(%error, "failed to remove replaced flat rootfs blob");
+        }
+        Ok(())
+    }
+
+    /// Remove the flat refs of manifests deleted from the image index, and the blobs they
+    /// named that no other ref names.
+    ///
+    /// Blobs go before refs, so an error or crash never strands a blob without a ref: a retry
+    /// finds it again, and a ref whose blob is gone reads as a cache miss. Returns the host
+    /// storage the removed blobs occupied. Extents still shared with a sandbox's reflinked
+    /// clone are counted but not released.
+    pub fn remove_flat_rootfs(&self, manifest_digests: &[Digest]) -> ImageResult<u64> {
+        let ref_paths: HashSet<PathBuf> = manifest_digests
+            .iter()
+            .map(|manifest_digest| self.flat_ref_path(manifest_digest))
+            .collect();
+        let mut artifact_digests = Vec::new();
+        for path in &ref_paths {
+            artifact_digests.extend(read_flat_ref_artifact(path)?);
+        }
+        let bytes_reclaimed = self.remove_unnamed_flat_blobs(&artifact_digests, &ref_paths)?;
+
+        let mut refs_removed = false;
+        for path in &ref_paths {
+            refs_removed |= remove_file_if_exists(path)?;
+        }
+        if refs_removed {
+            sync_directory(&self.flat_refs_dir)?;
+        }
+        Ok(bytes_reclaimed)
+    }
+
+    /// Remove flat rootfs artifacts without blocking the async runtime.
+    pub async fn remove_flat_rootfs_async(
+        &self,
+        manifest_digests: Vec<Digest>,
+    ) -> ImageResult<u64> {
+        let cache = self.clone();
+        tokio::task::spawn_blocking(move || cache.remove_flat_rootfs(&manifest_digests))
+            .await
+            .map_err(|error| ImageError::Io(std::io::Error::other(error)))?
+    }
+
+    /// Remove each of `artifact_digests` that no flat ref outside `ignored_refs` names.
+    fn remove_unnamed_flat_blobs(
+        &self,
+        artifact_digests: &[Digest],
+        ignored_refs: &HashSet<PathBuf>,
+    ) -> ImageResult<u64> {
+        if artifact_digests.is_empty() {
+            return Ok(0);
+        }
+        let mut named = HashSet::new();
+        for path in read_dir_paths(&self.flat_refs_dir)? {
+            if path.extension().and_then(|extension| extension.to_str()) == Some("json")
+                && !ignored_refs.contains(&path)
+                && let Some(artifact_digest) = read_flat_ref_artifact(&path)?
+            {
+                named.insert(artifact_digest);
+            }
+        }
+
+        let mut bytes_reclaimed = 0u64;
+        let mut removed = false;
+        for artifact_digest in artifact_digests {
+            if named.contains(artifact_digest) {
+                continue;
+            }
+            let path = self.flat_blob_path(artifact_digest);
+            let bytes = std::fs::metadata(&path)
+                .map(|metadata| allocated_bytes(&metadata))
+                .unwrap_or_default();
+            if remove_file_if_exists(&path)? {
+                removed = true;
+                bytes_reclaimed = bytes_reclaimed.saturating_add(bytes);
+            }
+        }
+        if removed {
+            sync_directory(&self.flat_blobs_dir)?;
+        }
+        Ok(bytes_reclaimed)
+    }
+
     // ── Staging/tmp paths (downloads, work dirs) ─────────────────────
 
     /// Root staging directory.
@@ -616,6 +722,65 @@ fn sync_directory(_path: &Path) -> ImageResult<()> {
     Ok(())
 }
 
+/// Read the blob a persisted flat ref names.
+///
+/// A ref that does not parse names nothing: it never resolves as a cache hit, and the next
+/// materialization replaces it.
+fn read_flat_ref_artifact(path: &Path) -> ImageResult<Option<Digest>> {
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(ImageError::Cache {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    match serde_json::from_slice::<FlatRootfsRef>(&data) {
+        Ok(reference) => Ok(reference.artifact_digest.parse().ok()),
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "corrupt flat rootfs ref, ignoring");
+            Ok(None)
+        }
+    }
+}
+
+fn read_dir_paths(path: &Path) -> ImageResult<Vec<PathBuf>> {
+    let cache_error = |source| ImageError::Cache {
+        path: path.to_path_buf(),
+        source,
+    };
+    std::fs::read_dir(path)
+        .map_err(cache_error)?
+        .map(|entry| entry.map(|entry| entry.path()).map_err(cache_error))
+        .collect()
+}
+
+/// Remove a file, returning whether it existed.
+fn remove_file_if_exists(path: &Path) -> ImageResult<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(ImageError::Cache {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Host storage a file occupies. Flat blobs are sparse, so their length overstates it.
+#[cfg(unix)]
+fn allocated_bytes(metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.blocks().saturating_mul(512)
+}
+
+#[cfg(not(unix))]
+fn allocated_bytes(metadata: &std::fs::Metadata) -> u64 {
+    metadata.len()
+}
+
 pub(crate) fn parse_cached_image_metadata(
     path: &Path,
     data: &str,
@@ -695,6 +860,24 @@ mod tests {
             .unwrap()
     }
 
+    /// Publish a ref for `manifest` naming a blob `artifact` with 8 bytes of content.
+    fn publish_flat(cache: &GlobalCache, manifest: &Digest, artifact: &Digest) -> FlatRootfsRef {
+        std::fs::write(cache.flat_blob_path(artifact), [7u8; 8]).unwrap();
+        let reference = FlatRootfsRef {
+            schema: 1,
+            manifest_digest: manifest.to_string(),
+            derivation_digest: digest('0').to_string(),
+            artifact_digest: artifact.to_string(),
+            materializer_abi: 1,
+            uuid: "00".repeat(16),
+            virtual_size_bytes: 8,
+            inode_count: 2,
+            content_bytes: 8,
+        };
+        cache.write_flat_ref(manifest, &reference).unwrap();
+        reference
+    }
+
     #[test]
     fn flat_cache_separates_manifest_refs_from_content_blobs() {
         let directory = tempfile::tempdir().unwrap();
@@ -728,6 +911,103 @@ mod tests {
             content_bytes: 7,
         };
         cache.write_flat_ref(&manifest, &reference).unwrap();
+
+        assert_eq!(cache.read_flat_ref(&manifest).unwrap(), Some(reference));
+    }
+
+    #[test]
+    fn removing_manifests_removes_their_refs_and_the_blobs_no_ref_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = GlobalCache::new(directory.path()).unwrap();
+        let (removed, kept, sharing) = (digest('a'), digest('b'), digest('c'));
+        let (removed_blob, kept_blob) = (digest('1'), digest('2'));
+        publish_flat(&cache, &removed, &removed_blob);
+        publish_flat(&cache, &kept, &kept_blob);
+        // Two manifests may name one content-addressed blob.
+        publish_flat(&cache, &sharing, &kept_blob);
+
+        cache
+            .remove_flat_rootfs(&[removed.clone(), sharing.clone(), digest('8')])
+            .unwrap();
+
+        assert!(!cache.flat_ref_path(&removed).exists());
+        assert!(!cache.flat_ref_path(&sharing).exists());
+        assert!(!cache.flat_blob_path(&removed_blob).exists());
+        assert!(cache.read_flat_ref(&kept).unwrap().is_some());
+
+        cache
+            .remove_flat_rootfs(std::slice::from_ref(&kept))
+            .unwrap();
+
+        assert_eq!(std::fs::read_dir(&cache.flat_refs_dir).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&cache.flat_blobs_dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn replacing_a_ref_removes_the_blob_only_it_named() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = GlobalCache::new(directory.path()).unwrap();
+        let (manifest, other) = (digest('a'), digest('b'));
+        let (old_blob, shared_blob, new_blob) = (digest('1'), digest('2'), digest('3'));
+        publish_flat(&cache, &manifest, &old_blob);
+        publish_flat(&cache, &other, &shared_blob);
+        std::fs::write(cache.flat_blob_path(&new_blob), [7u8; 8]).unwrap();
+        let mut reference = cache.read_flat_ref(&manifest).unwrap().unwrap();
+
+        reference.artifact_digest = shared_blob.to_string();
+        cache.replace_flat_ref(&manifest, &reference).unwrap();
+
+        assert!(!cache.flat_blob_path(&old_blob).exists());
+
+        reference.artifact_digest = new_blob.to_string();
+        cache.replace_flat_ref(&manifest, &reference).unwrap();
+
+        // The other manifest still names the previous blob.
+        assert!(cache.flat_blob_path(&shared_blob).exists());
+        assert_eq!(cache.read_flat_ref(&manifest).unwrap(), Some(reference));
+    }
+
+    #[test]
+    fn an_unreadable_ref_stops_removal_before_anything_is_deleted() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = GlobalCache::new(directory.path()).unwrap();
+        let (removed, blob) = (digest('a'), digest('1'));
+        publish_flat(&cache, &removed, &blob);
+        // Reading a directory fails for every user, on every platform.
+        let unreadable = cache.flat_ref_path(&digest('b'));
+        std::fs::create_dir(&unreadable).unwrap();
+
+        assert!(
+            cache
+                .remove_flat_rootfs(std::slice::from_ref(&removed))
+                .is_err()
+        );
+        assert!(cache.read_flat_ref(&removed).unwrap().is_some());
+
+        std::fs::remove_dir(&unreadable).unwrap();
+        cache
+            .remove_flat_rootfs(std::slice::from_ref(&removed))
+            .unwrap();
+
+        assert!(!cache.flat_ref_path(&removed).exists());
+        assert!(!cache.flat_blob_path(&blob).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_previous_ref_does_not_fail_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let cache = GlobalCache::new(directory.path()).unwrap();
+        let (manifest, new_blob) = (digest('a'), digest('2'));
+        let mut reference = publish_flat(&cache, &manifest, &digest('1'));
+        let path = cache.flat_ref_path(&manifest);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::write(cache.flat_blob_path(&new_blob), [7u8; 8]).unwrap();
+        reference.artifact_digest = new_blob.to_string();
+
+        cache.replace_flat_ref(&manifest, &reference).unwrap();
 
         assert_eq!(cache.read_flat_ref(&manifest).unwrap(), Some(reference));
     }

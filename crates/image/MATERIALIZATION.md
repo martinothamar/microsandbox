@@ -86,3 +86,5 @@ Registry descriptor digests authenticate compressed bytes; config `diff_id`s aut
 ## Storage and garbage collection
 
 Registry materialization in flat mode retains shared EROFS inputs as well as complete per-image ext4 outputs. Prepared-root import retains only the OCI metadata and complete ext4 output. Garbage collection must treat manifest metadata, fsmeta/VMDK, flat references, and active sandbox disks as roots and remove an EROFS layer only when no reachable image composition references its `diff_id`.
+
+Image removal and prune delete the flat reference of each manifest they remove from the database, and its blob when no remaining reference names it; replacing a reference deletes its previous blob the same way. Flat artifacts are deleted by name without a lock, so a removal concurrent with a pull, import or sandbox create of the same manifest can make that operation fail; callers serialize them. Flat artifacts of a manifest that is no longer in the database are not reclaimed.
