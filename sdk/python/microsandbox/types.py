@@ -1543,7 +1543,7 @@ class DnsConfig:
     """Block DNS responses resolving to private IPs. Default: True."""
     nameservers: tuple[str, ...] = ()
     """Nameservers to forward queries to. Accepts IP, IP:PORT, HOST, or
-    HOST:PORT. When set, overrides the host's /etc/resolv.conf."""
+    HOST:PORT. When set, replaces the host's system resolver."""
     query_timeout_ms: int | None = None
     """Per-DNS-query timeout in milliseconds. Default: 5000."""
 

@@ -88,7 +88,22 @@ msb create python --name safe-agent --net-default allow \
 
 <Tooltip tip="Custom nameservers are not available on microsandbox cloud. Cloud sandboxes use platform-managed DNS."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
 
-By default, microsandbox uses the host's resolver list. Set `nameservers` when you need specific resolvers.
+By default, microsandbox resolves through the host's system resolver, so a running sandbox follows the host to a new network:
+
+- **Linux** uses the nameservers in `/etc/resolv.conf` and re-reads them when the file changes.
+- **macOS** asks mDNSResponder, the resolver macOS applications use, so VPN split DNS and `/etc/resolver` files apply, and `.local` names without a configured resolver use multicast DNS on the host's network. Responses include answer records only, and a missing name, or a lookup while the host has no reachable DNS server, gets an empty answer instead of `NXDOMAIN`.
+- **Windows** uses the Windows DNS Client.
+
+Some names describe the host's network, so the gateway answers them with `NXDOMAIN` unless the sandbox may reach it, or rebind protection is off:
+
+- Names under `.local` and the link-local reverse zones can be answered by multicast DNS. They resolve when rebind protection admits both the first and last address of a private or link-local range, as the `private` profile does. Rules for narrower ranges, such as a single subnet, do not count.
+- Reverse lookups of private or link-local addresses resolve when rebind protection admits the address, as it would for a forward answer.
+
+Forward names in a VPN's split-DNS zones resolve as they do on the host. Rebind protection filters their private addresses but not their other records, and a sandbox can tell a filtered name, answered with `NXDOMAIN`, from a missing one.
+
+Names containing non-ASCII bytes are answered with `NXDOMAIN`, because a system resolver may map them to other names after policy has checked them. Internationalized names work in their ASCII punycode form (`xn--…`), which is what clients send; UTF-8 DNS-SD instance names cannot be looked up.
+
+Set `nameservers` when you need specific resolvers; they stay fixed for the sandbox's lifetime.
 
 Nameservers can be IP addresses, hostnames, or either form with a port. microsandbox resolves hostnames once when the sandbox starts.
 

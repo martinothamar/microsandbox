@@ -503,4 +503,4 @@ jobs:
           $ErrorActionPreference = "Stop"
           . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
           Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
-          cargo +stable test --locked -p microsandbox-network --lib --target ${{ matrix.rust_target }} dns::windows_resolver::
+          cargo +stable test --locked -p microsandbox-network --lib --target ${{ matrix.rust_target }} dns::upstream::system::windows::

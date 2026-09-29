@@ -1005,7 +1005,7 @@ where
     I::Item: Into<Nameserver>
 ```
 
-Set the upstream nameservers to forward DNS queries to. Replaces any previously-set nameservers. When empty, the interceptor falls back to the host's `/etc/resolv.conf` (or, on macOS, the SystemConfiguration dynamic store). Each element converts into [`Nameserver`](#nameserver): a `SocketAddr`, an `IpAddr`, or a parsed string via `"dns.google:53".parse::<Nameserver>()?`.
+Set the upstream nameservers to forward DNS queries to. Replaces any previously-set nameservers. When empty, queries go through the host's system resolver (see [DNS](/networking/dns#pinning-nameservers)). Each element converts into [`Nameserver`](#nameserver): a `SocketAddr`, an `IpAddr`, or a parsed string via `"dns.google:53".parse::<Nameserver>()?`.
 
 <p className="msb-label">Parameters</p>
 

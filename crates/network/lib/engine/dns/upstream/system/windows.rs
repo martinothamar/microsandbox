@@ -14,6 +14,8 @@ use std::slice;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use hickory_net::proto::op::Message;
+use hickory_net::proto::serialize::binary::{BinDecodable, BinEncodable};
 use tokio::sync::oneshot;
 use windows_sys::Win32::Foundation::{DNS_REQUEST_PENDING, ERROR_SUCCESS};
 use windows_sys::Win32::NetworkManagement::Dns::{
@@ -22,7 +24,8 @@ use windows_sys::Win32::NetworkManagement::Dns::{
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
-use super::common::transport::Transport;
+use crate::engine::dns::common::transport::Transport;
+use crate::engine::dns::upstream::GatewayQuery;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -59,7 +62,7 @@ struct RawDnsApi {
 }
 
 /// Resolver for host-default DNS queries on Windows.
-pub(crate) struct WindowsSystemResolver {
+pub(crate) struct SystemResolver {
     query_timeout: Duration,
     raw_api: Option<RawDnsApi>,
 }
@@ -81,7 +84,7 @@ struct PendingQuery {
 // Methods
 //--------------------------------------------------------------------------------------------------
 
-impl WindowsSystemResolver {
+impl SystemResolver {
     pub(crate) fn new(query_timeout: Duration) -> Self {
         Self {
             query_timeout,
@@ -89,12 +92,34 @@ impl WindowsSystemResolver {
         }
     }
 
+    /// Resolve one gateway query through the Windows DNS Client.
+    pub(crate) async fn query(&self, query: &GatewayQuery<'_>) -> io::Result<Message> {
+        let raw_query = query.message.to_bytes().map_err(|error| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("failed to encode DNS query: {error}"),
+            )
+        })?;
+        let response = self.query_raw(&raw_query, query.transport).await?;
+        Message::from_bytes(&response).map_err(|error| {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!("Windows system DNS returned an invalid response: {error}"),
+            )
+        })
+    }
+
+    /// Proxy relay names are only resolved through explicitly configured
+    /// nameservers on Windows.
+    pub(crate) fn check_proxy_resolution(&self) -> io::Result<()> {
+        Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "proxy relay domain resolution requires an explicit DNS nameserver on Windows",
+        ))
+    }
+
     /// Resolve one guest wire-format query through the Windows DNS Client.
-    pub(crate) async fn query(
-        &self,
-        raw_query: &[u8],
-        transport: Transport,
-    ) -> io::Result<Vec<u8>> {
+    async fn query_raw(&self, raw_query: &[u8], transport: Transport) -> io::Result<Vec<u8>> {
         if self.raw_api.is_none() {
             return compatibility::query(raw_query, transport, self.query_timeout).await;
         }
@@ -341,8 +366,8 @@ mod tests {
             b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
             0x01,
         ];
-        let resolver = WindowsSystemResolver::new(Duration::from_secs(10));
-        let response = resolver.query(&query, Transport::Udp).await.unwrap();
+        let resolver = SystemResolver::new(Duration::from_secs(10));
+        let response = resolver.query_raw(&query, Transport::Udp).await.unwrap();
         assert!(response.len() >= 12);
         assert_eq!(&response[..2], &[0x12, 0x34]);
         assert_ne!(u16::from_be_bytes([response[6], response[7]]), 0);

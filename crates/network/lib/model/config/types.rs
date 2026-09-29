@@ -150,12 +150,12 @@ pub struct DnsConfig {
     #[serde(default = "default_true")]
     pub rebind_protection: bool,
 
-    /// Nameservers to forward DNS queries to. When empty, fall back to
-    /// the `nameserver` entries in the host's `/etc/resolv.conf`. Set
-    /// this to pin specific resolvers (e.g. `1.1.1.1:53`, `dns.google`)
-    /// or to work around split-DNS / VPN setups where the host's
-    /// resolv.conf is incomplete. Accepts IPs, `IP:PORT`, or hostnames
-    /// (resolved once at startup via the host's OS resolver).
+    /// Nameservers to forward DNS queries to. When empty, queries go
+    /// through the host's system resolver, which follows network changes
+    /// and VPN split DNS. Set this to pin specific resolvers (e.g.
+    /// `1.1.1.1:53`, `dns.google`); pinned resolvers stay fixed and do not
+    /// apply split DNS. Accepts IPs, `IP:PORT`, or hostnames (resolved
+    /// once at startup via the host's OS resolver).
     #[serde(default)]
     pub nameservers: Vec<Nameserver>,
 

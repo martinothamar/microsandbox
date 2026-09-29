@@ -79,7 +79,7 @@ msb run alpine --pull never \
 ```
 
 - **Resolver failover:** servers are tried in order after a timeout or connection failure. A DNS response such as `REFUSED` or `SERVFAIL` does not trigger failover.
-- **Split DNS:** macOS supplies its primary resolver list, not per-domain VPN resolver selection. An explicit nameserver handles sandbox lookups; it does not recreate the host's split-DNS rules. Use an approved resolver that can answer the names the workload needs.
+- **Split DNS:** without explicit nameservers, sandbox lookups go through the host's system resolver (see [DNS configuration](/networking/dns)). On macOS and Windows its VPN split-DNS rules apply; on Linux they apply when `/etc/resolv.conf` names a split-aware local resolver such as systemd-resolved. An explicit nameserver replaces that path and does not recreate the host's split-DNS rules. Use an approved resolver that can answer the names the workload needs.
 - **DNS access:** `allow@dns` permits queries through the gateway. The service address rule permits its private DNS answer, as explained below.
 
 Nameserver settings select the default upstreams. Applications can request another resolver if network policy allows it, and DNS over HTTPS looks like ordinary HTTPS. Pair corporate DNS with destination restrictions when all lookups must follow company policy. See [DNS configuration](/networking/dns) for SDK examples and transport behavior.

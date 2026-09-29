@@ -391,8 +391,8 @@ impl DnsBuilder {
     }
 
     /// Set the upstream nameservers to forward queries to. When one or
-    /// more are set, the interceptor uses these instead of the
-    /// nameservers in the host's `/etc/resolv.conf`. Replaces any
+    /// more are set, the interceptor uses these instead of the host's
+    /// system resolver. Replaces any
     /// previously-set nameservers. Each element is any type convertible
     /// into [`Nameserver`] (`SocketAddr`, `IpAddr`, or a parsed
     /// string via `"dns.google:53".parse::<Nameserver>()?`).

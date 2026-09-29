@@ -19,7 +19,6 @@ engine = [
     "control",
     "dep:base64",
     "dep:bytes",
-    "dep:core-foundation",
     "dep:crossbeam-queue",
     "dep:futures",
     "dep:hickory-net",
@@ -39,7 +38,6 @@ engine = [
     "dep:rustls-pki-types",
     "dep:socket2",
     "dep:smoltcp",
-    "dep:system-configuration",
     "dep:time",
     "dep:tokio",
     "dep:tokio-rustls",
@@ -71,7 +69,6 @@ parking_lot = { workspace = true, optional = true }
 pem = { version = "3", optional = true }
 percent-encoding = { version = "2", optional = true }
 rcgen = { workspace = true, optional = true }
-resolv-conf = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
@@ -100,14 +97,9 @@ tokio-socks = { workspace = true, optional = true }
 tracing.workspace = true
 zeroize = { workspace = true }
 
-# macOS reads DNS servers from SystemConfiguration / SCDynamicStore rather
-# than /etc/resolv.conf. On VPN + split-DNS setups, the file version is
-# stale or incomplete. These deps let us query the live system state.
-[target.'cfg(target_os = "macos")'.dependencies]
-# Pinned to 0.9 to match system-configuration 0.7. Bumping to 0.10 would
-# create two incompatible CFString/CFArray/... types in the build.
-core-foundation = { version = "0.9", optional = true }
-system-configuration = { version = "0.7", optional = true }
+# Linux resolves host-default DNS through the nameservers in /etc/resolv.conf.
+[target.'cfg(target_os = "linux")'.dependencies]
+resolv-conf = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_Dns", "Win32_System_LibraryLoader"], optional = true }

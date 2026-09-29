@@ -72,3 +72,10 @@ jobs:
 
       - name: Test workspace
         run: cargo +stable test --workspace --exclude microsandbox-agentd
+
+      # The macOS resolver goes through mDNSResponder; these tests need the
+      # runner's network, so they are ignored in the workspace run above.
+      - name: Test macOS system DNS resolver
+        if: inputs.os == 'darwin'
+        run: |
+          cargo +stable test -p microsandbox-network --lib dns::upstream::system::macos:: -- --include-ignored
