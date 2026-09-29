@@ -406,7 +406,7 @@ impl TcpProxy {
             || controller.is_some()
             || secrets.has_plain_http_candidates()
             || secrets.has_host_scoped_secrets();
-        let (initial_buf, is_tls) = if want_headers {
+        let (initial_buf, is_tls, server_spoke_first) = if want_headers {
             tokio::select! {
                 biased;
                 () = wait_for_revocation(&mut control_grant) => {
@@ -425,7 +425,7 @@ impl TcpProxy {
                 ) => result?,
             }
         } else {
-            (initial_buf, false)
+            (initial_buf, false, false)
         };
 
         if let Some(tls_state) = tls_state.clone()
@@ -490,6 +490,9 @@ impl TcpProxy {
                 None => handler,
             }
         });
+        if server_spoke_first && let Some(handler) = secrets_handler.as_mut() {
+            handler.observe_server_bytes_before_first_request();
+        }
 
         // Replay the buffered first flight — run through secrets handler first.
         if !initial_buf.is_empty() {
@@ -622,6 +625,11 @@ impl TcpProxy {
                             // A server-first byte means this is not an HTTP CONNECT
                             // tunnel to a proxy. Keep relaying normally afterward.
                             late_connect_state = None;
+                            // Server bytes pass unchanged; the handler only
+                            // watches them for a protocol switch.
+                            if let Some(handler) = secrets_handler.as_mut() {
+                                handler.observe_server_bytes(&server_buf[..n]);
+                            }
                             let data = Bytes::copy_from_slice(&server_buf[..n]);
                             if to_smoltcp.send(data).await.is_err() {
                                 // Channel closed — poll loop dropped the receiver.
@@ -1284,8 +1292,8 @@ fn extract_http_host(buf: &[u8]) -> Option<String> {
 }
 
 /// Finish classifying the guest's first flight after the upstream socket is
-/// open, returning the (possibly extended) first-flight buffer and whether it
-/// is a TLS record.
+/// open, returning the (possibly extended) first-flight buffer, whether it
+/// is a TLS record, and whether server bytes were relayed to the guest first.
 ///
 /// `buf` carries whatever a pre-connect domain-rule peek already captured; when
 /// it is non-empty the TLS/plain decision is already settled and only header
@@ -1309,8 +1317,9 @@ async fn classify_first_flight(
     want_headers: bool,
     max: usize,
     budget: Duration,
-) -> io::Result<(Vec<u8>, bool)> {
+) -> io::Result<(Vec<u8>, bool, bool)> {
     let mut server_buf = vec![0u8; SERVER_READ_BUF_SIZE];
+    let mut server_spoke = false;
     let timeout_fut = tokio::time::sleep(budget);
     tokio::pin!(timeout_fut);
 
@@ -1330,7 +1339,7 @@ async fn classify_first_flight(
                 || buf.len() >= max
                 || buf.windows(4).any(|w| w == b"\r\n\r\n");
             if done {
-                return Ok((buf, is_tls));
+                return Ok((buf, is_tls, server_spoke));
             }
         }
 
@@ -1338,7 +1347,7 @@ async fn classify_first_flight(
             biased;
             _ = &mut timeout_fut => {
                 let is_tls = buf.first() == Some(&0x16);
-                return Ok((buf, is_tls));
+                return Ok((buf, is_tls, server_spoke));
             }
             // Guest → buffer (not forwarded here; the caller replays it once the
             // handler is built, so substitution applies to the first flight too).
@@ -1346,7 +1355,7 @@ async fn classify_first_flight(
                 Some(bytes) => buf.extend_from_slice(&bytes),
                 None => {
                     let is_tls = buf.first() == Some(&0x16);
-                    return Ok((buf, is_tls));
+                    return Ok((buf, is_tls, server_spoke));
                 }
             },
             // Server → guest: relay immediately so a server-first banner is never
@@ -1354,13 +1363,14 @@ async fn classify_first_flight(
             server = server_rx.read(&mut server_buf) => match server {
                 Ok(0) => {
                     let is_tls = buf.first() == Some(&0x16);
-                    return Ok((buf, is_tls));
+                    return Ok((buf, is_tls, server_spoke));
                 }
                 Ok(n) => {
+                    server_spoke = true;
                     let data = Bytes::copy_from_slice(&server_buf[..n]);
                     if to_smoltcp.send(data).await.is_err() {
                         let is_tls = buf.first() == Some(&0x16);
-                        return Ok((buf, is_tls));
+                        return Ok((buf, is_tls, server_spoke));
                     }
                     shared.proxy_wake.wake();
                 }
@@ -2080,6 +2090,153 @@ pub(crate) mod tests {
             "a denied CONNECT target must not open the tunnel"
         );
         drop(from_tx);
+    }
+
+    const WEBSOCKET_UPGRADE: &[u8] = b"GET /ws HTTP/1.1\r\nHost: api.example.com\r\n\
+        Upgrade: websocket\r\nConnection: Upgrade\r\n\
+        Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+    /// Masked client text frame "Hello" from RFC 6455 section 5.7.
+    const WEBSOCKET_CLIENT_FRAME: &[u8] = b"\x81\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58";
+
+    /// Run a controlled plain-TCP relay whose guest side stays open.
+    fn spawn_controlled_relay(
+        guest_dst: SocketAddr,
+        controller: &crate::control::test_support::TestController,
+    ) -> (
+        mpsc::Sender<Bytes>,
+        mpsc::Receiver<Bytes>,
+        JoinHandle<io::Result<()>>,
+    ) {
+        let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
+        let (to_tx, to_rx) = mpsc::channel::<Bytes>(8);
+        let proxy = TcpProxy::new(
+            guest_dst,
+            UpstreamTcpTarget::direct(guest_dst),
+            from_rx,
+            to_tx,
+            Arc::new(SharedState::new(4)),
+            Arc::new(NetworkPolicy::allow_all()),
+            Arc::new(SecretsConfig::default()),
+            None,
+            false,
+            Arc::new(ProxyConnectState::new()),
+            None,
+        )
+        .with_controller(Some(controller.client()));
+        (from_tx, to_rx, tokio::spawn(proxy.try_run()))
+    }
+
+    async fn read_request_headers(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut received = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !received.windows(4).any(|window| window == b"\r\n\r\n") {
+            let n = stream.read(&mut buf).await.unwrap();
+            assert_ne!(n, 0, "connection closed before the request headers");
+            received.extend_from_slice(&buf[..n]);
+        }
+        received
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_plain_websocket_relays_frames_after_101() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        const RESPONSE_START: &[u8] = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: web";
+        const RESPONSE_END: &[u8] = b"socket\r\nConnection: Upgrade\r\n\
+            Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n\x81\x02hi";
+
+        let controller = TestController::start(TestDecision::Allow).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let guest_dst = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request_headers(&mut stream).await;
+            stream.write_all(RESPONSE_START).await.unwrap();
+            stream.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            stream.write_all(RESPONSE_END).await.unwrap();
+            let mut frame = vec![0u8; WEBSOCKET_CLIENT_FRAME.len()];
+            stream.read_exact(&mut frame).await.unwrap();
+            (request, frame)
+        });
+        let (guest_tx, mut guest_rx, proxy) = spawn_controlled_relay(guest_dst, &controller);
+
+        guest_tx
+            .send(Bytes::from_static(WEBSOCKET_UPGRADE))
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        while response.len() < RESPONSE_START.len() + RESPONSE_END.len() {
+            let bytes = tokio::time::timeout(Duration::from_secs(5), guest_rx.recv())
+                .await
+                .expect("server response should reach the guest")
+                .expect("relay closed before the response");
+            response.extend_from_slice(&bytes);
+        }
+        guest_tx
+            .send(Bytes::from_static(WEBSOCKET_CLIENT_FRAME))
+            .await
+            .unwrap();
+
+        let (request, frame) = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("frame should reach the server")
+            .unwrap();
+        assert_eq!(request, WEBSOCKET_UPGRADE);
+        assert_eq!(response, [RESPONSE_START, RESPONSE_END].concat());
+        assert_eq!(frame, WEBSOCKET_CLIENT_FRAME);
+        tokio::time::timeout(Duration::from_secs(5), proxy)
+            .await
+            .expect("relay should end when the server closes")
+            .unwrap()
+            .unwrap();
+        let operations = controller.operations();
+        assert!(
+            matches!(
+                operations.as_slice(),
+                [
+                    NetworkOperation::Connect { .. },
+                    NetworkOperation::HttpRequest { method, path, .. },
+                ] if method == "GET" && path == "/ws"
+            ),
+            "{operations:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_plain_websocket_frames_before_101_close_the_connection() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let controller = TestController::start(TestDecision::Allow).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let guest_dst = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request_headers(&mut stream).await;
+            let mut rest = Vec::new();
+            stream.read_to_end(&mut rest).await.unwrap();
+            (request, rest)
+        });
+        let (guest_tx, _guest_rx, proxy) = spawn_controlled_relay(guest_dst, &controller);
+
+        guest_tx
+            .send(Bytes::from_static(WEBSOCKET_UPGRADE))
+            .await
+            .unwrap();
+        guest_tx
+            .send(Bytes::from_static(WEBSOCKET_CLIENT_FRAME))
+            .await
+            .unwrap();
+
+        let (request, rest) = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("relay should close the upstream connection")
+            .unwrap();
+        assert_eq!(request, WEBSOCKET_UPGRADE);
+        assert!(rest.is_empty(), "frame bytes reached the server: {rest:?}");
+        proxy.await.unwrap().unwrap();
+        drop(guest_tx);
     }
 
     #[test]

@@ -567,6 +567,9 @@ pub(crate) async fn intercept_relay(
                 match result {
                     Ok(0) => break,
                     Ok(n) => {
+                        // Server bytes pass unchanged; the handler only
+                        // watches them for a protocol switch.
+                        secrets_handler.observe_server_bytes(&server_buf[..n]);
                         guest_tls
                             .writer()
                             .write_all(&server_buf[..n])

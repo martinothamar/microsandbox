@@ -123,6 +123,28 @@ pub struct SecretsHandler {
     http2_state: Option<Http2State>,
     /// Host controller used for request authorization and deferred material.
     controller: Option<NetworkControlClient>,
+    /// Whether the controller authorized an HTTP request on this connection.
+    /// From then on every request boundary must start another HTTP request.
+    http_request_authorized: bool,
+    /// Whether an authorized HTTP/1.1 upgrade may still switch this controlled
+    /// connection to opaque forwarding.
+    upgrade: UpgradeState,
+}
+
+/// Protocol-switch eligibility of a controlled HTTP/1.1 connection.
+///
+/// Only the connection's first request may upgrade, and the connection turns
+/// opaque only after the server's `101 Switching Protocols` response to that
+/// request has been observed in the server-to-guest direction.
+#[derive(Debug)]
+enum UpgradeState {
+    /// Neither a request was authorized nor server bytes were seen yet.
+    FirstRequestPending,
+    /// The first request asked to upgrade. Holds the response header bytes
+    /// received so far.
+    AwaitingResponse { response: Vec<u8> },
+    /// The connection can no longer switch protocols.
+    Ineligible,
 }
 
 /// HTTP framing version observed by the trusted parser.
@@ -313,6 +335,13 @@ struct RequestSummary {
     host: Option<String>,
 }
 
+/// Finds the HTTP/1 request line while walking a header block line by line.
+/// Empty lines before it are legal and are not the request line.
+#[derive(Default)]
+struct RequestLineTracker {
+    seen: bool,
+}
+
 #[derive(Clone, Copy)]
 enum RequestHeaders<'a> {
     Http1(&'a str),
@@ -360,6 +389,14 @@ enum PlaceholderMatchForm {
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
+
+impl RequestLineTracker {
+    fn is_request_line(&mut self, line: &str) -> bool {
+        let is_request_line = !self.seen && !line.is_empty();
+        self.seen |= is_request_line;
+        is_request_line
+    }
+}
 
 impl EligibleSecret {
     fn value<'a>(&'a self, material: &'a BTreeMap<String, SecretMaterial>) -> Option<&'a str> {
@@ -418,11 +455,12 @@ impl EligibleSecret {
     /// the secret's `headers` / `basic_auth` / `query` flags.
     fn substitute_in_headers(&self, headers: &str, value: &str) -> String {
         let mut result = String::with_capacity(headers.len());
+        let mut request_line = RequestLineTracker::default();
         for (i, line) in headers.split("\r\n").enumerate() {
             if i > 0 {
                 result.push_str("\r\n");
             }
-            match self.substitute_in_header_line(line, i == 0, value) {
+            match self.substitute_in_header_line(line, request_line.is_request_line(line), value) {
                 Some((line, _)) => result.push_str(&line),
                 None => result.push_str(line),
             }
@@ -486,10 +524,13 @@ impl EligibleSecret {
     /// substitution rules.
     fn detect_http1_secret_locations(&self, headers: &str) -> BTreeSet<SecretLocation> {
         let mut locations = BTreeSet::new();
-        for (index, line) in headers.split("\r\n").enumerate() {
-            if let Some((_, location)) =
-                self.substitute_in_header_line(line, index == 0, &self.placeholder)
-            {
+        let mut request_line = RequestLineTracker::default();
+        for line in headers.split("\r\n") {
+            if let Some((_, location)) = self.substitute_in_header_line(
+                line,
+                request_line.is_request_line(line),
+                &self.placeholder,
+            ) {
                 locations.insert(location);
             }
         }
@@ -897,6 +938,8 @@ impl SecretsHandler {
             unsupported_body_tail: Vec::new(),
             http2_state: None,
             controller: None,
+            http_request_authorized: false,
+            upgrade: UpgradeState::FirstRequestPending,
         }
     }
 
@@ -961,6 +1004,14 @@ impl SecretsHandler {
             HttpState::AwaitingHeaders => {}
         }
 
+        // A client that asked to switch protocols waits for the server's
+        // response (RFC 6455 section 4.1). Until it is seen nothing may follow
+        // the upgrade request, neither the new protocol nor another request.
+        if !data.is_empty() && matches!(self.upgrade, UpgradeState::AwaitingResponse { .. }) {
+            tracing::warn!("bytes after an upgrade request before its response; blocking");
+            return Err(SecretViolationAction::Block);
+        }
+
         if self.http_pending.is_empty() {
             if has_complete_http2_preface(data) {
                 self.http2_state = Some(Http2State::default());
@@ -998,7 +1049,8 @@ impl SecretsHandler {
             }
             if header_boundary.is_none() {
                 if first_line_is_not_http_request(&self.http_pending)
-                    || !looks_like_http_request_prefix(&self.http_pending)
+                    || !(looks_like_http_request_prefix(&self.http_pending)
+                        || self.holds_split_empty_line(&self.http_pending))
                 {
                     let pending = std::mem::take(&mut self.http_pending);
                     let output = self.substitute_ready(&pending)?.into_owned();
@@ -1017,7 +1069,7 @@ impl SecretsHandler {
         }
 
         if find_header_boundary(data).is_none()
-            && looks_like_http_request_prefix(data)
+            && (looks_like_http_request_prefix(data) || self.holds_split_empty_line(data))
             && !first_line_is_not_http_request(data)
         {
             if data.len() > MAX_HTTP_HEADER_BYTES {
@@ -1031,6 +1083,13 @@ impl SecretsHandler {
     }
 
     fn scan_opaque<'a>(&mut self, data: &'a [u8]) -> Result<Cow<'a, [u8]>, SecretViolationAction> {
+        // A controlled connection that carries HTTP must not leave per-request
+        // authorization by switching to opaque forwarding. Only an observed
+        // `101 Switching Protocols` enters opaque mode there.
+        if !self.opaque && self.requires_http_requests() {
+            tracing::warn!("non-HTTP bytes on a controlled HTTP connection; blocking");
+            return Err(SecretViolationAction::Block);
+        }
         // Fail closed when invalid bytes still resemble an HTTP request that
         // requires authority validation. Conclusively opaque streams rely on
         // the proxy's connection-level policy and still block placeholders.
@@ -1105,6 +1164,16 @@ impl SecretsHandler {
         // Split raw bytes at the header boundary BEFORE converting to owned strings.
         // This avoids position shifts from from_utf8_lossy replacement chars.
         let boundary = find_header_boundary(data);
+        // Without a header boundary these bytes are forwarded unparsed. On a
+        // controlled HTTP connection that would carry the next request past
+        // the controller, so only empty lines may precede a request line.
+        if boundary.is_none()
+            && self.requires_http_requests()
+            && !skip_leading_empty_http_lines(data).is_empty()
+        {
+            tracing::warn!("non-HTTP bytes on a controlled HTTP connection; blocking");
+            return Err(SecretViolationAction::Block);
+        }
         let (header_bytes, after_headers) = match boundary {
             Some(pos) => (&data[..pos], &data[pos..]),
             None => (data, &[] as &[u8]),
@@ -1180,17 +1249,19 @@ impl SecretsHandler {
 
         // Everything from `data` belonging to this request, headers and body.
         let this_request = &data[..header_bytes.len() + body_bytes.len()];
-        let material = if boundary.is_some() {
-            let headers = String::from_utf8_lossy(header_bytes);
-            self.authorize_request(
-                &http1_request_summary(headers.as_ref()),
-                HttpVersion::Http1,
-                None,
-                RequestHeaders::Http1(headers.as_ref()),
-            )?
-        } else {
-            BTreeMap::new()
-        };
+        // A block of only empty lines carries no request to authorize.
+        let material =
+            if boundary.is_some() && !skip_leading_empty_http_lines(header_bytes).is_empty() {
+                let headers = String::from_utf8_lossy(header_bytes);
+                self.authorize_request(
+                    &http1_request_summary(headers.as_ref()),
+                    HttpVersion::Http1,
+                    None,
+                    RequestHeaders::Http1(headers.as_ref()),
+                )?
+            } else {
+                BTreeMap::new()
+            };
 
         // Check for disallowed placeholders before forwarding or substituting data.
         self.apply_blocking_action(self.detect_blocking_action(
@@ -1601,6 +1672,77 @@ impl SecretsHandler {
             && self.ineligible_for_substitution.is_empty()
     }
 
+    /// Observes bytes the server sent toward the guest on this connection.
+    ///
+    /// Server bytes are never held back or changed. A controlled connection
+    /// only uses them to recognize the `101 Switching Protocols` response that
+    /// lets an authorized first-request upgrade continue as opaque forwarding.
+    pub(crate) fn observe_server_bytes(&mut self, data: &[u8]) {
+        if self.controller.is_none() || data.is_empty() {
+            return;
+        }
+        let response = match &mut self.upgrade {
+            UpgradeState::Ineligible => return,
+            // Bytes before the first request cannot answer it.
+            UpgradeState::FirstRequestPending => {
+                self.upgrade = UpgradeState::Ineligible;
+                return;
+            }
+            UpgradeState::AwaitingResponse { response } => response,
+        };
+        response.extend_from_slice(data);
+        loop {
+            let Some(end) = find_header_boundary(response) else {
+                if response.len() > MAX_HTTP_HEADER_BYTES {
+                    self.upgrade = UpgradeState::Ineligible;
+                }
+                return;
+            };
+            match http1_response_status(&response[..end]) {
+                // Bytes after this header block already belong to the new
+                // protocol and are not inspected.
+                Some(101) => {
+                    self.opaque = true;
+                    self.upgrade = UpgradeState::Ineligible;
+                    return;
+                }
+                // Other interim responses have no body; the final response
+                // to the upgrade request follows them.
+                Some(100..=199) => {
+                    response.drain(..end);
+                }
+                // A final response keeps the connection on HTTP.
+                _ => {
+                    self.upgrade = UpgradeState::Ineligible;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Records that the server sent bytes before the guest's first request
+    /// reached this handler, so no later response can be the first request's.
+    pub(crate) fn observe_server_bytes_before_first_request(&mut self) {
+        if matches!(self.upgrade, UpgradeState::FirstRequestPending) {
+            self.upgrade = UpgradeState::Ineligible;
+        }
+    }
+
+    /// Whether every request boundary on this connection must start an HTTP
+    /// request. Intercepted TLS on a controlled connection carries HTTP from
+    /// its first byte; any other controlled connection does after the
+    /// controller authorized its first request.
+    fn requires_http_requests(&self) -> bool {
+        self.controller.is_some() && (self.tls_intercepted || self.http_request_authorized)
+    }
+
+    /// Whether a controlled HTTP connection should hold bytes that end in the
+    /// CR of an empty line whose LF has not arrived yet. Empty lines may
+    /// precede a request line, and a write can split their CRLF.
+    fn holds_split_empty_line(&self, data: &[u8]) -> bool {
+        self.requires_http_requests() && skip_leading_empty_http_lines(data) == b"\r"
+    }
+
     fn needs_body_substitution(&self) -> bool {
         self.eligible_for_substitution.iter().any(|secret| {
             secret.substitute_body && (!secret.require_tls_identity || self.tls_intercepted)
@@ -1644,7 +1786,7 @@ impl SecretsHandler {
     }
 
     fn authorize_request(
-        &self,
+        &mut self,
         summary: &RequestSummary,
         version: HttpVersion,
         stream_id: Option<u32>,
@@ -1684,6 +1826,17 @@ impl SecretsHandler {
             })
             .map_err(|_| SecretViolationAction::Block)?;
         drop(grant);
+        self.http_request_authorized = true;
+        self.upgrade = match (&self.upgrade, headers) {
+            (UpgradeState::FirstRequestPending, RequestHeaders::Http1(headers))
+                if http1_requests_upgrade(headers) =>
+            {
+                UpgradeState::AwaitingResponse {
+                    response: Vec::new(),
+                }
+            }
+            _ => UpgradeState::Ineligible,
+        };
 
         let mut uses = BTreeMap::<String, BTreeSet<SecretLocation>>::new();
         for secret in &self.eligible_for_substitution {
@@ -2717,7 +2870,8 @@ fn request_summary(headers: &str, protocol: RequestProtocol) -> RequestSummary {
 }
 
 fn http1_request_summary(headers: &str) -> RequestSummary {
-    let mut lines = headers.split("\r\n");
+    // Empty lines before the request line are legal HTTP/1 and are ignored.
+    let mut lines = headers.split("\r\n").skip_while(|line| line.is_empty());
     let Some(request_line) = lines.next() else {
         return RequestSummary::default();
     };
@@ -2735,6 +2889,55 @@ fn http1_request_summary(headers: &str) -> RequestSummary {
         path: Some(redacted_request_path(target)),
         host: host.map(ToOwned::to_owned),
     }
+}
+
+/// Whether an HTTP/1.1 request header block asks to switch to WebSocket: an
+/// `Upgrade` field that offers only `websocket` plus a `Connection` field that
+/// lists the `upgrade` option.
+///
+/// Other protocols are not eligible. A switch to `h2c` carries HTTP requests,
+/// and staying out of opaque mode keeps them on the per-stream HTTP/2 path.
+fn http1_requests_upgrade(headers: &str) -> bool {
+    let mut lines = headers.split("\r\n").skip_while(|line| line.is_empty());
+    if lines.next().and_then(http_request_version) != Some("HTTP/1.1") {
+        return false;
+    }
+    let mut upgrade = false;
+    let mut connection_upgrade = false;
+    for (name, value) in lines
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+    {
+        if name.eq_ignore_ascii_case("upgrade") {
+            let mut protocols = value.split(',').map(str::trim).filter(|p| !p.is_empty());
+            let offered = protocols.clone().next().is_some();
+            let websocket_only = protocols.all(|protocol| {
+                protocol
+                    .split('/')
+                    .next()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("websocket"))
+            });
+            upgrade |= offered && websocket_only;
+        } else if name.eq_ignore_ascii_case("connection") {
+            connection_upgrade |= value
+                .split(',')
+                .any(|option| option.trim().eq_ignore_ascii_case("upgrade"));
+        }
+    }
+    upgrade && connection_upgrade
+}
+
+/// Status code of an HTTP/1.1 response header block with a valid status line.
+fn http1_response_status(header_block: &[u8]) -> Option<u16> {
+    let line_end = header_block
+        .windows(2)
+        .position(|window| window == b"\r\n")?;
+    let rest = header_block[..line_end].strip_prefix(b"HTTP/1.1 ")?;
+    let (code, reason) = rest.split_at_checked(3)?;
+    if !code.iter().all(u8::is_ascii_digit) || !(reason.is_empty() || reason[0] == b' ') {
+        return None;
+    }
+    std::str::from_utf8(code).ok()?.parse().ok()
 }
 
 fn http2_request_summary(headers: &str) -> RequestSummary {
@@ -3349,6 +3552,8 @@ fn detect_blocking_action_with_tail(
         && !headers.is_empty()
         && !is_scoped_fragment_location(location_hint)
     {
+        // Empty lines before the request line are legal and carry nothing.
+        let headers = headers.trim_start_matches("\r\n");
         let (request_line, metadata) = headers.split_once("\r\n").unwrap_or((headers, ""));
         if let Some((method, target, version)) = split_http_request_line(request_line) {
             fragments.push((method.as_bytes(), RequestLocation::Unknown));
@@ -4230,6 +4435,541 @@ mod tests {
         assert_eq!(
             scripted_requests(&controller),
             ["GET /a", "POST /b", "GET /c"]
+        );
+    }
+
+    const UPGRADE_REQUEST: &[u8] = b"GET /ws HTTP/1.1\r\nHost: api.example.com\r\n\
+        Upgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n\
+        Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+    const SWITCHING_PROTOCOLS: &[u8] = b"HTTP/1.1 101 Switching Protocols\r\n\
+        Upgrade: websocket\r\nConnection: Upgrade\r\n\
+        Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
+
+    /// Masked client text frame "Hello" from RFC 6455 section 5.7.
+    const MASKED_TEXT_FRAME: &[u8] = b"\x81\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58";
+
+    /// Masked client binary frame whose masking key contains control bytes.
+    const MASKED_BINARY_FRAME: &[u8] = b"\x82\x84\x01\x0d\x0a\x00\x60\x6f\x69\x64";
+
+    fn assert_frames_forwarded(handler: &mut SecretsHandler) {
+        for frame in [MASKED_TEXT_FRAME, MASKED_BINARY_FRAME] {
+            assert_eq!(handler.substitute(frame).unwrap().as_ref(), frame);
+        }
+    }
+
+    fn assert_frames_blocked(handler: &mut SecretsHandler) {
+        for frame in [MASKED_TEXT_FRAME, MASKED_BINARY_FRAME] {
+            assert_eq!(
+                handler.substitute(frame).unwrap_err(),
+                SecretViolationAction::Block
+            );
+        }
+    }
+
+    /// Both first-flight variants from the HTTP authorization review: on
+    /// intercepted TLS the connection identity is the SNI, so the first
+    /// decrypted bytes must already be an HTTP request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_tls_first_flight_must_be_http() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let controller = TestController::start(TestDecision::Allow).await;
+        let config = make_config(Vec::new());
+
+        let mut opaque_switch = scripted_tls_handler(&config, &controller);
+        let opaque_result =
+            opaque_switch.substitute(b"\x01\r\nGET /x HTTP/1.1\r\nHost: api.example.com\r\n\r\n");
+        assert_eq!(opaque_result.unwrap_err(), SecretViolationAction::Block);
+
+        let mut no_boundary = scripted_tls_handler(&config, &controller);
+        let no_boundary_result =
+            no_boundary.substitute(b"FOO\r\nGET /x HTTP/1.1\r\nHost: api.example.com\r\n\r");
+        assert_eq!(
+            no_boundary_result.unwrap_err(),
+            SecretViolationAction::Block
+        );
+
+        let mut binary = scripted_tls_handler(&config, &controller);
+        let binary_result = binary.substitute(b"\x00\x00\x00\x0c\x01binary");
+        assert_eq!(binary_result.unwrap_err(), SecretViolationAction::Block);
+
+        assert!(scripted_requests(&controller).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_tls_first_flight_accepts_leading_empty_lines_and_split_requests() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let controller = TestController::start(TestDecision::Allow).await;
+        let config = make_config(Vec::new());
+        let mut handler = scripted_tls_handler(&config, &controller);
+
+        let empty = handler.substitute(b"\r\n").unwrap().into_owned();
+        let start = handler
+            .substitute(b"GET / HTTP/1.1\r\nHo")
+            .unwrap()
+            .into_owned();
+        let end = handler
+            .substitute(b"st: api.example.com\r\n\r\n")
+            .unwrap()
+            .into_owned();
+
+        assert!(empty.is_empty() && start.is_empty());
+        assert_eq!(end, b"\r\nGET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n");
+        assert_eq!(scripted_requests(&controller), ["GET /"]);
+    }
+
+    /// After an authorized request, a non-HTTP line followed by a request
+    /// split so that no write contains the header boundary must not reach the
+    /// server without per-request authorization.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_keepalive_rejects_split_request_after_non_http_line() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let controller = TestController::start(TestDecision::Allow).await;
+        let config = make_config(Vec::new());
+        for line in [b"\x01".as_slice(), b"FOO".as_slice()] {
+            let mut handler = scripted_plain_handler(&config, &controller);
+            handler
+                .substitute(b"GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+                .expect("first request is authorized");
+
+            let mut first = line.to_vec();
+            first.extend_from_slice(b"\r\nGET /x HTTP/1.1\r\nHost: denied.com\r\n\r");
+            let forwarded = handler.substitute(&first).is_ok() && handler.substitute(b"\n").is_ok();
+
+            assert!(
+                !forwarded,
+                "unauthorized request forwarded after {line:?}; controller saw {:?}",
+                scripted_requests(&controller)
+            );
+        }
+    }
+
+    /// After an authorized request, a control byte at a request boundary must
+    /// not switch the connection to opaque forwarding, directly or from a
+    /// buffered request prefix.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_keepalive_rejects_opaque_switch_after_request() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let controller = TestController::start(TestDecision::Allow).await;
+        let config = make_config(Vec::new());
+        for buffered_prefix in [false, true] {
+            let mut handler = scripted_plain_handler(&config, &controller);
+            handler
+                .substitute(b"GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+                .expect("first request is authorized");
+            if buffered_prefix {
+                let buffered = handler
+                    .substitute(b"X")
+                    .expect("request prefix is buffered");
+                assert!(buffered.is_empty());
+            }
+
+            let result = handler.substitute(b"\x01\r\nGET /x HTTP/1.1\r\nHost: denied.com\r\n\r\n");
+
+            assert_eq!(
+                result.unwrap_err(),
+                SecretViolationAction::Block,
+                "buffered prefix: {buffered_prefix}"
+            );
+        }
+        assert_eq!(scripted_requests(&controller), ["GET /", "GET /"]);
+    }
+
+    /// Empty lines before a request line are legal HTTP/1 and must still be
+    /// authorized and forwarded on a controlled keep-alive connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_keepalive_accepts_leading_empty_lines_before_request() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let controller = TestController::start(TestDecision::Allow).await;
+        let config = make_config(Vec::new());
+        let mut handler = scripted_plain_handler(&config, &controller);
+
+        let first = handler
+            .substitute(b"\r\nGET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+            .map(Cow::into_owned);
+        let separator = handler.substitute(b"\r\n\r\n").map(Cow::into_owned);
+        let split_start = handler.substitute(b"\r\n").map(Cow::into_owned);
+        let split_end = handler
+            .substitute(b"GET /next HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+            .map(Cow::into_owned);
+
+        assert_eq!(
+            first.unwrap(),
+            b"\r\nGET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n"
+        );
+        assert_eq!(separator.unwrap(), b"\r\n\r\n");
+        assert!(split_start.unwrap().is_empty());
+        assert_eq!(
+            split_end.unwrap(),
+            b"\r\nGET /next HTTP/1.1\r\nHost: api.example.com\r\n\r\n"
+        );
+        assert_eq!(scripted_requests(&controller), ["GET /", "GET /next"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_connection_holds_an_empty_line_split_inside_its_crlf() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let controller = TestController::start(TestDecision::Allow).await;
+        let config = make_config(Vec::new());
+        for tls in [true, false] {
+            let mut handler = if tls {
+                scripted_tls_handler(&config, &controller)
+            } else {
+                scripted_plain_handler(&config, &controller)
+            };
+            if !tls {
+                handler
+                    .substitute(b"GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+                    .unwrap();
+            }
+            assert!(handler.substitute(b"\r\n\r").unwrap().is_empty());
+            assert_eq!(
+                handler
+                    .substitute(b"\nGET /next HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+                    .unwrap()
+                    .as_ref(),
+                b"\r\n\r\nGET /next HTTP/1.1\r\nHost: api.example.com\r\n\r\n"
+            );
+            // A CR that is not followed by its LF is not an empty line.
+            assert!(handler.substitute(b"\r").unwrap().is_empty());
+            assert_eq!(
+                handler.substitute(b"\rGET / HTTP/1.1\r\n\r\n").unwrap_err(),
+                SecretViolationAction::Block
+            );
+        }
+        assert_eq!(
+            scripted_requests(&controller),
+            ["GET /next", "GET /", "GET /next"]
+        );
+    }
+
+    /// A controlled plain connection that never carried an HTTP request keeps
+    /// upstream's handling of binary and server-first protocols.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_plain_non_http_first_flight_keeps_upstream_forwarding() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let controller = TestController::start(TestDecision::Allow).await;
+        let config = make_config(Vec::new());
+        let mut binary = SecretsHandler::new_plain_http_invalid_host(&config)
+            .with_guest_dst("198.51.100.10:9000".parse().unwrap())
+            .with_controller(controller.client());
+        let mut banner = SecretsHandler::new_plain_http_invalid_host(&config)
+            .with_guest_dst("198.51.100.10:22".parse().unwrap())
+            .with_controller(controller.client());
+
+        let binary_first = binary
+            .substitute(b"\x00\x00\x00\x0c\x01binary\r\n")
+            .map(Cow::into_owned);
+        let binary_later = binary
+            .substitute(b"GET /x HTTP/1.1\r\nHost: denied.com\r\n\r\n")
+            .map(Cow::into_owned);
+        let banner_first = banner
+            .substitute(b"SSH-2.0-OpenSSH_10.0\r\n")
+            .map(Cow::into_owned);
+        let banner_later = banner
+            .substitute(b"\x00\x00\x01\x0c\x0a\x14kex")
+            .map(Cow::into_owned);
+
+        assert_eq!(binary_first.unwrap(), b"\x00\x00\x00\x0c\x01binary\r\n");
+        assert_eq!(
+            binary_later.unwrap(),
+            b"GET /x HTTP/1.1\r\nHost: denied.com\r\n\r\n"
+        );
+        assert_eq!(banner_first.unwrap(), b"SSH-2.0-OpenSSH_10.0\r\n");
+        assert_eq!(banner_later.unwrap(), b"\x00\x00\x01\x0c\x0a\x14kex");
+        assert!(scripted_requests(&controller).is_empty());
+    }
+
+    /// Leading empty lines must not shift the request line into the header
+    /// section: a placeholder in the query stays a query use.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn leading_empty_lines_keep_request_line_query_location() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let request = b"\r\nGET /?k=$TOKEN HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+
+        // Material authorized for the query is substituted in the query.
+        let controller = TestController::start(TestDecision::Allow).await;
+        let mut query_secret = deferred_token_secret(true);
+        query_secret.substitution = SecretSubstitution {
+            headers: false,
+            query: true,
+            body: false,
+        };
+        let mut handler = scripted_tls_handler(&make_config(vec![query_secret]), &controller);
+        let output = handler.substitute(request).unwrap().into_owned();
+        assert_eq!(
+            output,
+            b"\r\nGET /?k=resolved-provider-token HTTP/1.1\r\nHost: api.example.com\r\n\r\n"
+        );
+        let operations = controller.operations();
+        assert!(
+            matches!(
+                operations.as_slice(),
+                [
+                    NetworkOperation::HttpRequest { .. },
+                    NetworkOperation::SecretUse { locations, .. },
+                ] if locations == &[SecretLocation::Query]
+            ),
+            "{operations:?}"
+        );
+
+        // A header-only secret never lands in the query, controlled or not.
+        let header_secret = deferred_token_secret(true);
+        let controller = TestController::start(TestDecision::Allow).await;
+        let mut handler = scripted_tls_handler(&make_config(vec![header_secret]), &controller);
+        assert_eq!(
+            handler.substitute(request).unwrap_err(),
+            SecretViolationAction::Block
+        );
+        assert_eq!(scripted_requests(&controller), ["GET /"]);
+
+        let config = make_config(vec![make_secret(
+            "$TOKEN",
+            "real-secret",
+            "api.example.com",
+        )]);
+        let mut handler = SecretsHandler::new(&config, "api.example.com", true);
+        assert_eq!(
+            handler.substitute(request).unwrap_err(),
+            SecretViolationAction::Block
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_upgrade_switches_to_opaque_after_101() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let controller = TestController::start(TestDecision::Allow).await;
+        let config = make_config(Vec::new());
+        for tls in [true, false] {
+            let mut handler = if tls {
+                scripted_tls_handler(&config, &controller)
+            } else {
+                scripted_plain_handler(&config, &controller)
+            };
+            assert_eq!(
+                handler.substitute(UPGRADE_REQUEST).unwrap().as_ref(),
+                UPGRADE_REQUEST
+            );
+
+            // The response header block arrives split across two reads; the
+            // second read also carries the server's first frame.
+            let (start, end) = SWITCHING_PROTOCOLS.split_at(40);
+            handler.observe_server_bytes(start);
+            let mut end = end.to_vec();
+            end.extend_from_slice(b"\x81\x02hi");
+            handler.observe_server_bytes(&end);
+
+            assert_frames_forwarded(&mut handler);
+        }
+        assert_eq!(scripted_requests(&controller), ["GET /ws", "GET /ws"]);
+    }
+
+    #[test]
+    fn only_websocket_upgrades_are_eligible() {
+        let request = |upgrade: &str| {
+            format!(
+                "GET / HTTP/1.1\r\nHost: api.example.com\r\nUpgrade: {upgrade}\r\n\
+                 Connection: Upgrade\r\n\r\n"
+            )
+        };
+        assert!(http1_requests_upgrade(&request("websocket")));
+        assert!(http1_requests_upgrade(&request("WebSocket")));
+        assert!(!http1_requests_upgrade(&request("h2c")));
+        assert!(!http1_requests_upgrade(&request("websocket, h2c")));
+        assert!(!http1_requests_upgrade(&request("")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_h2c_upgrade_keeps_http2_streams_authorized() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        const H2C_UPGRADE: &[u8] = b"GET / HTTP/1.1\r\nHost: api.example.com\r\n\
+            Upgrade: h2c\r\nConnection: Upgrade, HTTP2-Settings\r\n\
+            HTTP2-Settings: AAMAAABkAAQCAAAAAAIAAAAA\r\n\r\n";
+        const H2C_SWITCH: &[u8] =
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n";
+
+        let controller = TestController::start(TestDecision::Allow).await;
+        let config = make_config(Vec::new());
+        for tls in [true, false] {
+            let mut handler = if tls {
+                scripted_tls_handler(&config, &controller)
+            } else {
+                scripted_plain_handler(&config, &controller)
+            };
+            handler.substitute(H2C_UPGRADE).unwrap();
+            handler.observe_server_bytes(H2C_SWITCH);
+            let request = h2_request(
+                &[
+                    (b":method", b"GET"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"api.example.com"),
+                    (b":path", b"/admin"),
+                ],
+                true,
+            );
+            handler.substitute(&request).unwrap();
+        }
+        assert_eq!(
+            scripted_requests(&controller),
+            ["GET /", "GET /admin #1", "GET /", "GET /admin #1"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_upgrade_skips_interim_responses_before_101() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let controller = TestController::start(TestDecision::Allow).await;
+        let mut handler = scripted_tls_handler(&make_config(Vec::new()), &controller);
+        handler.substitute(UPGRADE_REQUEST).unwrap();
+
+        handler.observe_server_bytes(b"HTTP/1.1 100 Continue\r\n\r\n");
+        let mut responses = b"HTTP/1.1 103 Early Hints\r\nLink: </a.css>\r\n\r\n".to_vec();
+        responses.extend_from_slice(SWITCHING_PROTOCOLS);
+        handler.observe_server_bytes(&responses);
+
+        assert_frames_forwarded(&mut handler);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_upgrade_blocks_frames_before_101() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let controller = TestController::start(TestDecision::Allow).await;
+        let config = make_config(Vec::new());
+        for frame in [MASKED_TEXT_FRAME, MASKED_BINARY_FRAME] {
+            let mut handler = scripted_tls_handler(&config, &controller);
+            handler.substitute(UPGRADE_REQUEST).unwrap();
+            // An incomplete response header block does not switch either.
+            handler.observe_server_bytes(b"HTTP/1.1 101 Switching Protocols\r\n");
+
+            assert_eq!(
+                handler.substitute(frame).unwrap_err(),
+                SecretViolationAction::Block
+            );
+        }
+
+        // Neither may a pipelined request in the same write.
+        let mut handler = scripted_tls_handler(&config, &controller);
+        let mut pipelined = UPGRADE_REQUEST.to_vec();
+        pipelined.extend_from_slice(b"GET /next HTTP/1.1\r\nHost: api.example.com\r\n\r\n");
+        assert_eq!(
+            handler.substitute(&pipelined).unwrap_err(),
+            SecretViolationAction::Block
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_upgrade_refused_by_server_stays_on_http() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let controller = TestController::start(TestDecision::Allow).await;
+        let mut handler = scripted_tls_handler(&make_config(Vec::new()), &controller);
+        handler.substitute(UPGRADE_REQUEST).unwrap();
+
+        handler.observe_server_bytes(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\n\r\n");
+        // A late 101 cannot answer the upgrade request any more.
+        handler.observe_server_bytes(SWITCHING_PROTOCOLS);
+
+        assert_frames_blocked(&mut handler);
+        let mut handler = scripted_tls_handler(&make_config(Vec::new()), &controller);
+        handler.substitute(UPGRADE_REQUEST).unwrap();
+        handler.observe_server_bytes(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\n\r\n");
+        let next = b"GET /next HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        assert_eq!(handler.substitute(next).unwrap().as_ref(), next);
+        assert_eq!(
+            scripted_requests(&controller),
+            ["GET /ws", "GET /ws", "GET /next"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_upgrade_is_honoured_only_for_the_first_request() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let controller = TestController::start(TestDecision::Allow).await;
+        let mut handler = scripted_plain_handler(&make_config(Vec::new()), &controller);
+        handler
+            .substitute(b"GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+            .unwrap();
+        handler.observe_server_bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        handler.substitute(UPGRADE_REQUEST).unwrap();
+        handler.observe_server_bytes(SWITCHING_PROTOCOLS);
+
+        assert_frames_blocked(&mut handler);
+        assert_eq!(scripted_requests(&controller), ["GET /", "GET /ws"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_101_without_upgrade_request_is_not_honoured() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let controller = TestController::start(TestDecision::Allow).await;
+        let config = make_config(Vec::new());
+        for request in [
+            b"GET /ws HTTP/1.1\r\nHost: api.example.com\r\n\r\n".as_slice(),
+            // `Upgrade` without the `Connection: upgrade` option.
+            b"GET /ws HTTP/1.1\r\nHost: api.example.com\r\nUpgrade: websocket\r\n\r\n".as_slice(),
+            // HTTP/1.0 has no protocol upgrade.
+            b"GET /ws HTTP/1.0\r\nHost: api.example.com\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n"
+                .as_slice(),
+        ] {
+            let mut handler = scripted_tls_handler(&config, &controller);
+            handler.substitute(request).unwrap();
+            handler.observe_server_bytes(SWITCHING_PROTOCOLS);
+
+            assert_frames_blocked(&mut handler);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_upgrade_after_server_first_bytes_is_not_honoured() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let controller = TestController::start(TestDecision::Allow).await;
+        let config = make_config(Vec::new());
+        for relayed_during_classification in [false, true] {
+            let mut handler = scripted_plain_handler(&config, &controller);
+            if relayed_during_classification {
+                handler.observe_server_bytes_before_first_request();
+            } else {
+                handler.observe_server_bytes(b"HTTP/1.1 101 Switching Protocols\r\n\r\n");
+            }
+            handler.substitute(UPGRADE_REQUEST).unwrap();
+            handler.observe_server_bytes(SWITCHING_PROTOCOLS);
+
+            assert_frames_blocked(&mut handler);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_upgrade_still_blocks_placeholders_in_opaque_mode() {
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let controller = TestController::start(TestDecision::Allow).await;
+        let config = make_config(vec![make_secret(
+            "$KEY",
+            "real-secret",
+            "other.example.com",
+        )]);
+        let mut handler = scripted_tls_handler(&config, &controller);
+        handler.substitute(UPGRADE_REQUEST).unwrap();
+        handler.observe_server_bytes(SWITCHING_PROTOCOLS);
+
+        assert_frames_forwarded(&mut handler);
+        assert_eq!(
+            handler.substitute(b"\x81\x04$KEY").unwrap_err(),
+            SecretViolationAction::Block
         );
     }
 
