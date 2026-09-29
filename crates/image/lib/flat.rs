@@ -106,7 +106,7 @@ pub(crate) fn materialize_flat_rootfs(
         inode_count: artifact.inode_count,
         content_bytes: artifact.content_bytes,
     };
-    cache.write_flat_ref(manifest_digest, &reference)?;
+    cache.replace_flat_ref(manifest_digest, &reference)?;
     Ok(reference)
 }
 
@@ -296,6 +296,43 @@ mod tests {
         assert_eq!(reference.content_bytes, b"flat-rootfs".len() as u64);
         assert_eq!(reference.inode_count, 3);
         assert_eq!(reference.virtual_size_bytes, 256 * 1024 * 1024);
+        assert!(cache.flat_blob_path(&artifact_digest).exists());
+        assert_eq!(cache.read_flat_ref(&manifest).unwrap(), Some(reference));
+    }
+
+    #[test]
+    fn rematerializing_over_a_stale_ref_removes_the_blob_it_named() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = GlobalCache::new(directory.path()).unwrap();
+        let manifest: Digest = format!("sha256:{}", "d".repeat(64)).parse().unwrap();
+        let diff_id: Digest = format!("sha256:{}", "e".repeat(64)).parse().unwrap();
+        crate::erofs::write_erofs(&FileTree::new(), &cache.layer_erofs_path(&diff_id)).unwrap();
+        let stale_blob: Digest = format!("sha256:{}", "f".repeat(64)).parse().unwrap();
+        std::fs::write(cache.flat_blob_path(&stale_blob), [0u8; 8]).unwrap();
+        let stale = FlatRootfsRef {
+            schema: FLAT_REF_SCHEMA,
+            manifest_digest: manifest.to_string(),
+            derivation_digest: format!("sha256:{}", "0".repeat(64)),
+            artifact_digest: stale_blob.to_string(),
+            materializer_abi: EXT4_ROOTFS_MATERIALIZER_ABI.saturating_sub(1),
+            uuid: "00".repeat(16),
+            virtual_size_bytes: 8,
+            inode_count: 1,
+            content_bytes: 0,
+        };
+        cache.write_flat_ref(&manifest, &stale).unwrap();
+
+        let reference = materialize_flat_rootfs(
+            &cache,
+            &manifest,
+            &[diff_id],
+            &Platform::host_linux(),
+            false,
+        )
+        .unwrap();
+
+        assert!(!cache.flat_blob_path(&stale_blob).exists());
+        let artifact_digest: Digest = reference.artifact_digest.parse().unwrap();
         assert!(cache.flat_blob_path(&artifact_digest).exists());
         assert_eq!(cache.read_flat_ref(&manifest).unwrap(), Some(reference));
     }

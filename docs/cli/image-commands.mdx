@@ -109,7 +109,7 @@ msb image inspect python --format json
 
 ## msb rmi
 
-Remove one or more cached images and their layers (layers shared with other images are kept).
+Remove one or more cached images, their layers and their flat root disks (artifacts shared with other images are kept).
 
 ```bash
 msb rmi python
@@ -133,7 +133,7 @@ msb image prune --yes
 msb image prune --format json
 ```
 
-Prune never removes images used by existing sandboxes or indexed snapshots. It also cleans up image metadata, unreachable manifests, orphaned layers, layer EROFS artifacts, fsmeta EROFS artifacts, and VMDK descriptor artifacts. Use `msb rmi --force` when you want to remove a specific image even though it is still referenced by a sandbox.
+Prune never removes images used by existing sandboxes or indexed snapshots. It also cleans up image metadata, unreachable manifests, orphaned layers, layer EROFS artifacts, fsmeta EROFS artifacts, VMDK descriptor artifacts, and flat root disks. Use `msb rmi --force` when you want to remove a specific image even though it is still referenced by a sandbox.
 
 | Flag | Description |
 |------|-------------|

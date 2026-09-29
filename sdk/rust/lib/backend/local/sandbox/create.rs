@@ -234,9 +234,11 @@ impl LocalBackend {
                     let flat_ref = cache
                         .read_flat_ref(&pull_result.manifest_digest)?
                         .ok_or_else(|| {
-                            crate::MicrosandboxError::Custom(
-                                "flat rootfs was not published by the image pull".into(),
-                            )
+                            crate::MicrosandboxError::Custom(format!(
+                                "flat rootfs for {} is missing from the image cache; a \
+                                 concurrent image removal or prune may have removed it",
+                                pull_result.manifest_digest
+                            ))
                         })?;
                     let artifact_digest: Digest =
                         flat_ref.artifact_digest.parse().map_err(|e| {

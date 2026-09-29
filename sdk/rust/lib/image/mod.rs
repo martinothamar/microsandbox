@@ -586,6 +586,9 @@ impl Image {
                 let _ = tokio::fs::remove_file(cache.fsmeta_erofs_lock_path(&digest)).await;
                 let _ = tokio::fs::remove_file(cache.vmdk_path(&digest)).await;
                 let _ = tokio::fs::remove_file(cache.vmdk_lock_path(&digest)).await;
+                if let Err(error) = cache.remove_flat_rootfs_async(vec![digest]).await {
+                    tracing::warn!(%error, "failed to remove flat rootfs artifacts");
+                }
             }
 
             if let Ok(image_ref) = reference.parse::<Reference>() {
@@ -737,6 +740,19 @@ impl Image {
                     bytes_reclaimed = bytes_reclaimed.saturating_add(bytes);
                     let _ = tokio::fs::remove_file(cache.vmdk_lock_path(&digest)).await;
                 }
+            }
+
+            let manifest_digests = cleanup
+                .manifest_digests
+                .iter()
+                .filter_map(|digest| digest.parse::<Digest>().ok())
+                .collect();
+            match cache.remove_flat_rootfs_async(manifest_digests).await {
+                Ok(bytes) => {
+                    measured |= bytes > 0;
+                    bytes_reclaimed = bytes_reclaimed.saturating_add(bytes);
+                }
+                Err(error) => tracing::warn!(%error, "failed to remove flat rootfs artifacts"),
             }
 
             if measured {
@@ -1100,10 +1116,68 @@ async fn try_persist_fast_path(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
-    use microsandbox_image::{CachedImageMetadata, ImageConfig};
+    use microsandbox_image::{CachedImageMetadata, FlatRootfsRef, ImageConfig};
+    use sha2::{Digest as _, Sha256};
 
     use super::*;
+
+    fn sha256(bytes: &[u8]) -> String {
+        format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+    }
+
+    /// Metadata for a layerless image whose manifest digest is derived from `seed`.
+    fn layerless_image(seed: &str) -> CachedImageMetadata {
+        let raw_config_json = format!(
+            r#"{{"architecture":"{}","os":"{}","rootfs":{{"type":"layers","diff_ids":[]}},"config":{{}}}}"#,
+            Platform::host_linux().arch,
+            Platform::host_linux().os
+        );
+        let config_digest = sha256(raw_config_json.as_bytes());
+        let raw_manifest_json = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest}","size":{}}},"layers":[],"annotations":{{"seed":"{seed}"}}}}"#,
+            raw_config_json.len()
+        );
+        CachedImageMetadata {
+            manifest_digest: sha256(raw_manifest_json.as_bytes()),
+            config_digest,
+            raw_manifest_json,
+            raw_config_json,
+            config: ImageConfig::default(),
+            layers: Vec::new(),
+        }
+    }
+
+    /// Publish a flat ref and an 8 KiB blob for `manifest_digest`, returning the blob path.
+    fn publish_flat(cache: &GlobalCache, manifest_digest: &str, blob_seed: &str) -> PathBuf {
+        let artifact_digest: Digest = sha256(blob_seed.as_bytes()).parse().unwrap();
+        let blob = cache.flat_blob_path(&artifact_digest);
+        std::fs::write(&blob, vec![1u8; 8192]).unwrap();
+        let manifest: Digest = manifest_digest.parse().unwrap();
+        let reference = FlatRootfsRef {
+            schema: 1,
+            manifest_digest: manifest_digest.to_string(),
+            derivation_digest: sha256(format!("derivation {blob_seed}").as_bytes()),
+            artifact_digest: artifact_digest.to_string(),
+            materializer_abi: 1,
+            uuid: "00".repeat(16),
+            virtual_size_bytes: 8192,
+            inode_count: 2,
+            content_bytes: 0,
+        };
+        cache.write_flat_ref(&manifest, &reference).unwrap();
+        blob
+    }
+
+    fn flat_entries(cache_dir: &Path) -> (usize, usize) {
+        let count = |dir: &str| {
+            std::fs::read_dir(cache_dir.join("flat").join(dir))
+                .unwrap()
+                .count()
+        };
+        (count("refs"), count("blobs"))
+    }
 
     #[test]
     fn test_default_backend_image_api_methods_stay_available() {
@@ -1151,5 +1225,54 @@ mod tests {
                 "org.example.feature": "enabled"
             }))
         );
+    }
+
+    #[tokio::test]
+    async fn remove_and_prune_delete_flat_rootfs_artifacts_of_removed_manifests() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = LocalBackend::builder()
+            .home(temp.path())
+            .build()
+            .await
+            .unwrap();
+        let cache = GlobalCache::new(&local.cache_dir()).unwrap();
+        let (removed, kept, old, new) = (
+            layerless_image("removed"),
+            layerless_image("kept"),
+            layerless_image("old"),
+            layerless_image("new"),
+        );
+        let removed_blob = publish_flat(&cache, &removed.manifest_digest, "removed");
+        let kept_blob = publish_flat(&cache, &kept.manifest_digest, "kept");
+        let old_blob = publish_flat(&cache, &old.manifest_digest, "old");
+        publish_flat(&cache, &new.manifest_digest, "new");
+        Image::persist(&local, "registry.example/removed:1", removed)
+            .await
+            .unwrap();
+        Image::persist(&local, "registry.example/kept:1", kept)
+            .await
+            .unwrap();
+        // A mutable tag moving to a new manifest leaves the old manifest untagged.
+        Image::persist(&local, "registry.example/agent:latest", old)
+            .await
+            .unwrap();
+        Image::persist(&local, "registry.example/agent:latest", new)
+            .await
+            .unwrap();
+
+        Image::remove_local(&local, "registry.example/removed:1", false)
+            .await
+            .unwrap();
+
+        assert!(!removed_blob.exists());
+        assert!(kept_blob.exists());
+        assert!(old_blob.exists());
+        assert_eq!(flat_entries(&local.cache_dir()), (3, 3));
+
+        let report = Image::prune_local(&local).await.unwrap();
+
+        assert_eq!(report.manifests_removed, 3);
+        assert_eq!(flat_entries(&local.cache_dir()), (0, 0));
+        assert!(report.bytes_reclaimed.is_some());
     }
 }
