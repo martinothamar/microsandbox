@@ -93,7 +93,8 @@ pub struct InstallOptions {
     pub source: InstallSource,
     /// Release version for [`InstallSource::ReleaseDownload`].
     pub version: String,
-    /// Replace an already complete installation.
+    /// Replace an existing installation, including a partial one left by an
+    /// interrupted install.
     pub force: bool,
     /// Verify the published pair after installation.
     pub verify: bool,
@@ -469,12 +470,22 @@ fn publish_pair(
         ));
     }
     let runtime = runtime_in_home(config);
-    let existing = pair_presence(&runtime.msb_path, &runtime.libkrunfw_path);
+    let mut existing = pair_presence(&runtime.msb_path, &runtime.libkrunfw_path);
     if existing == PairPresence::Partial {
-        return Err(MicrosandboxError::RuntimeIncomplete(format!(
-            "refusing to repair partial installation at {}",
-            config.home().display()
-        )));
+        if !force {
+            return Err(MicrosandboxError::RuntimeIncomplete(format!(
+                "refusing to repair partial installation at {} without force",
+                config.home().display()
+            )));
+        }
+        // Publication runs under the installation lock, so a partial pair here
+        // was left by an interrupted install rather than one in progress.
+        for path in [&runtime.msb_path, &runtime.libkrunfw_path] {
+            if path.is_file() {
+                fs::remove_file(path)?;
+            }
+        }
+        existing = PairPresence::Absent;
     }
     if existing == PairPresence::Complete && !force {
         return Ok(());
@@ -1022,6 +1033,45 @@ mod tests {
         assert_eq!(runtime.libkrunfw_path, expected_library);
         assert!(expected_msb.is_file());
         assert!(expected_library.is_file());
+    }
+
+    #[tokio::test]
+    async fn only_a_forced_install_repairs_a_partial_pair() {
+        let msb_name = microsandbox_utils::msb_binary_filename(std::env::consts::OS);
+        let library_name = microsandbox_utils::libkrunfw_filename(std::env::consts::OS);
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join(&msb_name), b"new-msb").unwrap();
+        fs::write(source.path().join(&library_name), b"new-library").unwrap();
+        for present in [
+            PathBuf::from(BIN_SUBDIR).join(&msb_name),
+            PathBuf::from(LIB_SUBDIR).join(&library_name),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let leftover = home.path().join(&present);
+            fs::create_dir_all(leftover.parent().unwrap()).unwrap();
+            fs::write(&leftover, b"interrupted").unwrap();
+            let config = GlobalConfig {
+                home: Some(home.path().to_path_buf()),
+                ..Default::default()
+            };
+            let options = |force| InstallOptions {
+                source: InstallSource::Directory(source.path().to_path_buf()),
+                force,
+                verify: false,
+                ..Default::default()
+            };
+
+            let refused = install_runtime(&config, options(false)).await;
+            assert!(
+                matches!(refused, Err(MicrosandboxError::RuntimeIncomplete(_))),
+                "{refused:?}"
+            );
+            assert_eq!(fs::read(&leftover).unwrap(), b"interrupted");
+
+            let runtime = install_runtime(&config, options(true)).await.unwrap();
+            assert_eq!(fs::read(runtime.msb_path).unwrap(), b"new-msb");
+            assert_eq!(fs::read(runtime.libkrunfw_path).unwrap(), b"new-library");
+        }
     }
 
     #[tokio::test]
