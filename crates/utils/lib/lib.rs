@@ -294,23 +294,25 @@ pub fn looks_like_local_path_text(s: &str) -> bool {
     }
 }
 
-/// Returns true when `s` starts with a Windows drive-rooted path prefix.
+/// Returns true when `s` starts with an ordinary or verbatim Windows drive-rooted path prefix.
 pub fn is_windows_drive_path_text(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'\\' | b'/')
+    windows_drive_separator_index(s).is_some()
 }
 
-/// Returns true when the colon at `index` is the drive separator in a Windows path.
+/// Returns true when the colon at `index` is the drive separator in an ordinary
+/// or verbatim Windows path.
 pub fn is_windows_drive_separator_at(s: &str, index: usize) -> bool {
-    let bytes = s.as_bytes();
-    index == 1
-        && bytes.len() >= 3
+    windows_drive_separator_index(s) == Some(index)
+}
+
+fn windows_drive_separator_index(s: &str) -> Option<usize> {
+    let (path, prefix_len) = s.strip_prefix(r"\\?\").map_or((s, 0), |path| (path, 4));
+    let bytes = path.as_bytes();
+    (bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
-        && matches!(bytes[2], b'\\' | b'/')
+        && matches!(bytes[2], b'\\' | b'/'))
+    .then_some(prefix_len + 1)
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -320,6 +322,42 @@ pub fn is_windows_drive_separator_at(s: &str, index: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_windows_drive_separator_accepts_ordinary_and_verbatim_paths() {
+        for (path, drive_colon) in [
+            (r"C:\data with spaces", 1),
+            ("d:/data", 1),
+            (r"\\?\C:\data with spaces", 5),
+        ] {
+            assert!(is_windows_drive_path_text(path), "{path:?}");
+            assert!(is_windows_drive_separator_at(path, drive_colon), "{path:?}");
+            assert!(!is_windows_drive_separator_at(path, usize::MAX));
+            let stream = format!("{path}:stream");
+            assert!(is_windows_drive_separator_at(&stream, drive_colon));
+            assert!(!is_windows_drive_separator_at(&stream, path.len()));
+        }
+    }
+
+    #[test]
+    fn test_windows_drive_separator_rejects_non_drive_colons() {
+        for path in [
+            "C:",
+            "C:relative",
+            "1:/data",
+            "ø:/data",
+            r"\\?\C:relative",
+            r"\\.\C:\data",
+            r"\\server\share\data:stream",
+            r"\\?\UNC\server\share\data:stream",
+            "/data:ro",
+        ] {
+            assert!(!is_windows_drive_path_text(path), "{path:?}");
+            for (index, _) in path.match_indices(':') {
+                assert!(!is_windows_drive_separator_at(path, index), "{path:?}");
+            }
+        }
+    }
 
     #[test]
     fn test_digdir_runtime_urls_use_the_downstream_release_namespace() {

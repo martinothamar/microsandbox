@@ -3605,34 +3605,23 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
     })
 }
 
-/// Split `host_path[:opts]`, skipping the drive colon in Windows paths.
+/// Split `host_path[:opts]`, skipping the drive colon in ordinary and verbatim Windows paths.
 fn split_mount_host_options(rest: &str) -> (&str, Option<&str>) {
-    let search = if windows_drive_path_prefix_len(rest).is_some() {
-        &rest[2..]
-    } else {
-        rest
-    };
-
-    match search.rsplit_once(':') {
-        Some((_prefix, opts)) => {
-            let split_at = rest.len() - opts.len() - 1;
-            let host = &rest[..split_at];
-            (host, Some(opts))
+    let separator = rest.rmatch_indices(':').find(|&(index, _)| {
+        #[cfg(windows)]
+        {
+            !microsandbox_utils::is_windows_drive_separator_at(rest, index)
         }
-        None => (rest, None),
-    }
-}
+        #[cfg(not(windows))]
+        {
+            let _ = index;
+            true
+        }
+    });
 
-/// Return the length of a Windows drive prefix when this target accepts one.
-fn windows_drive_path_prefix_len(rest: &str) -> Option<usize> {
-    #[cfg(windows)]
-    {
-        microsandbox_utils::is_windows_drive_path_text(rest).then_some(2)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = rest;
-        None
+    match separator {
+        Some((index, _)) => (&rest[..index], Some(&rest[index + 1..])),
+        None => (rest, None),
     }
 }
 
@@ -4231,11 +4220,25 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn test_parse_mount_spec_accepts_windows_drive_path() {
-        let p = parse_mount_spec(r"work:C:\Users\Stephen\data:ro,host-perms=mirror").unwrap();
-        assert_eq!(p.tag, "work");
-        assert_eq!(p.host_path, r"C:\Users\Stephen\data");
-        assert!(matches!(p.host_permissions, HostPermissions::Mirror));
-        assert!(p.readonly);
+        for host in [
+            r"C:\Users\Stephen\data with spaces",
+            "C:/Users/Stephen/data with spaces",
+            r"\\?\C:\Users\Stephen\data with spaces",
+            r"\\server\share\data with spaces",
+            r"\\?\UNC\server\share\data with spaces",
+        ] {
+            let p = parse_mount_spec(&format!("work:{host}")).unwrap();
+            assert_eq!(p.tag, "work");
+            assert_eq!(p.host_path, host);
+            assert!(!p.readonly);
+            assert!(matches!(p.host_permissions, HostPermissions::Private));
+
+            let p = parse_mount_spec(&format!("work:{host}:ro,host-perms=mirror")).unwrap();
+            assert_eq!(p.tag, "work");
+            assert_eq!(p.host_path, host);
+            assert!(matches!(p.host_permissions, HostPermissions::Mirror));
+            assert!(p.readonly);
+        }
     }
 
     #[test]

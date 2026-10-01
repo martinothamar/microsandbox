@@ -4286,21 +4286,25 @@ mod tests {
     #[tokio::test]
     #[cfg(windows)]
     async fn test_apply_explicit_dir_mount_with_windows_drive_path() {
-        let dir = make_temp_dir("msb-mount-dir-drive");
-        let spec = format!("{}:/work:ro", dir.display());
-        let mount = build_explicit(&spec, apply_explicit_dir_mount).await;
-        match mount {
-            VolumeMount::Bind {
-                host,
-                guest,
-                options,
-                ..
-            } => {
-                assert_eq!(host, dir);
-                assert_eq!(guest, "/work");
-                assert!(options.readonly);
+        let dir = make_temp_dir("msb mount dir drive");
+        for source in [dir.clone(), std::fs::canonicalize(&dir).unwrap()] {
+            for options in ["", ":ro"] {
+                let spec = format!("{}:/work{options}", source.display());
+                let mount = build_explicit(&spec, apply_explicit_dir_mount).await;
+                match mount {
+                    VolumeMount::Bind {
+                        host,
+                        guest,
+                        options: parsed,
+                        ..
+                    } => {
+                        assert_eq!(host, source);
+                        assert_eq!(guest, "/work");
+                        assert_eq!(parsed.readonly, !options.is_empty());
+                    }
+                    other => panic!("expected Bind, got {other:?}"),
+                }
             }
-            other => panic!("expected Bind, got {other:?}"),
         }
     }
 

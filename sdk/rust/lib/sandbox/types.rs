@@ -1887,26 +1887,62 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn test_validate_volume_mounts_accepts_windows_drive_host_paths() {
-        let mut mounts = vec![
-            VolumeMount::Bind {
-                host: PathBuf::from(r"C:\Users\Stephen\data"),
-                guest: "/data".to_string(),
-                options: MountOptions::default(),
-                stat_virtualization: StatVirtualization::Strict,
-                host_permissions: HostPermissions::Private,
-                follow_root_symlinks: false,
-                quota_mib: None,
-            },
-            VolumeMount::DiskImage {
-                host: PathBuf::from(r"C:\Users\Stephen\data.raw"),
-                guest: "/disk".to_string(),
-                format: DiskImageFormat::Raw,
-                fstype: None,
-                options: MountOptions::default(),
-            },
-        ];
+        for host in [
+            r"C:\Users\Stephen\data",
+            "C:/Users/Stephen/data",
+            r"\\?\C:\Users\Stephen\data with spaces",
+            r"\\server\share\data",
+            r"\\?\UNC\server\share\data",
+        ] {
+            let mut mounts = vec![
+                VolumeMount::Bind {
+                    host: PathBuf::from(host),
+                    guest: "/data".to_string(),
+                    options: MountOptions::default(),
+                    stat_virtualization: StatVirtualization::Strict,
+                    host_permissions: HostPermissions::Private,
+                    follow_root_symlinks: false,
+                    quota_mib: None,
+                },
+                VolumeMount::DiskImage {
+                    host: PathBuf::from(format!("{host}.raw")),
+                    guest: "/disk".to_string(),
+                    format: DiskImageFormat::Raw,
+                    fstype: None,
+                    options: MountOptions::default(),
+                },
+            ];
+            validate_volume_mounts(&mut mounts).unwrap();
+        }
+    }
 
-        validate_volume_mounts(&mut mounts).unwrap();
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_drive_canonical_bind_host_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = std::fs::canonicalize(directory.path()).unwrap();
+        assert!(source.to_str().unwrap().starts_with(r"\\?\"));
+        let mut mount = MountBuilder::new("/data").bind(&source).build().unwrap();
+        validate_volume_mounts(std::slice::from_mut(&mut mount)).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_drive_bind_host_path_rejects_streams_and_delimiters() {
+        for path in [
+            r"C:\data:stream",
+            r"\\?\C:\data:stream",
+            r"\\?\C:\data,ro",
+            r"\\?\C:\data;other",
+            r"\\server\share\data:stream",
+            r"\\?\UNC\server\share\data:stream",
+        ] {
+            let err = MountBuilder::new("/data").bind(path).build().unwrap_err();
+            assert!(
+                err.to_string().contains("bind host path"),
+                "{path:?}: {err}"
+            );
+        }
     }
 
     #[test]
