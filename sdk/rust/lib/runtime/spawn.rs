@@ -5781,32 +5781,37 @@ mod tests {
     #[tokio::test]
     #[cfg(windows)]
     async fn test_machine_cli_args_windows_drive_bind_mount_preserves_drive_colon() {
-        let config = SandboxBuilder::new("test")
-            .image("/tmp/rootfs")
-            .volume("/data", |m| {
-                m.bind(r"C:\Users\Stephen\data")
-                    .readonly()
-                    .stat_virtualization(StatVirtualization::Relaxed)
-                    .host_permissions(HostPermissions::Mirror)
-            })
-            .build()
-            .await
-            .unwrap();
+        for host in [
+            r"C:\Users\Stephen\data",
+            r"\\?\C:\Users\Stephen\data with spaces",
+        ] {
+            let config = SandboxBuilder::new("test")
+                .image("/tmp/rootfs")
+                .volume("/data", |m| {
+                    m.bind(host)
+                        .readonly()
+                        .stat_virtualization(StatVirtualization::Relaxed)
+                        .host_permissions(HostPermissions::Mirror)
+                })
+                .build()
+                .await
+                .unwrap();
 
-        let rendered = render_args(&config);
-        let data_tag = super::guest_mount_tag("/data");
-        let expected = format!(
-            r"{data_tag}:C:\Users\Stephen\data:ro,stat-virt=relaxed,host-perms=mirror,quota={}",
-            crate::sandbox::config::DEFAULT_BIND_QUOTA_MIB
-        );
+            let rendered = render_args(&config);
+            let data_tag = super::guest_mount_tag("/data");
+            let expected = format!(
+                "{data_tag}:{host}:ro,stat-virt=relaxed,host-perms=mirror,quota={}",
+                crate::sandbox::config::DEFAULT_BIND_QUOTA_MIB
+            );
 
-        assert!(
-            rendered
-                .windows(2)
-                .any(|pair| pair[0] == "--mount" && pair[1] == expected),
-            "missing Windows drive bind --mount arg in {rendered:?}"
-        );
-        assert!(rendered.contains(&format!("MSB_DIR_MOUNTS={data_tag}:/data:ro")));
+            assert!(
+                rendered
+                    .windows(2)
+                    .any(|pair| pair[0] == "--mount" && pair[1] == expected),
+                "missing Windows drive bind --mount arg in {rendered:?}"
+            );
+            assert!(rendered.contains(&format!("MSB_DIR_MOUNTS={data_tag}:/data:ro")));
+        }
     }
 
     #[tokio::test]
