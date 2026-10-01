@@ -11,13 +11,11 @@ on:
   workflow_dispatch:
 
 concurrency:
-  # Manual runs must never replace pending or active required PR checks.
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && 'manual' || 'automatic' }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main-digdir' }}
 
 permissions:
   contents: read
-  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,6 +29,8 @@ env:
 jobs:
   select-run:
     name: Select CI run
+    permissions:
+      actions: read
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -42,16 +42,25 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CI_EVENT: ${{ github.event_name }}
+          CI_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
           run_checks=true
-          if [ "${CI_EVENT}" = workflow_dispatch ]; then
+          if [ "${CI_EVENT}" = workflow_dispatch ] && [ "${CI_ATTEMPT}" = 1 ]; then
             run_created=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq .created_at)
             automatic_run=$(gh api \
               "repos/${GITHUB_REPOSITORY}/actions/workflows/check-digdir.yml/runs?event=pull_request&head_sha=${GITHUB_SHA}&per_page=100" \
-              --jq ".workflow_runs | any(.status != \"completed\" or .updated_at >= \"${run_created}\")")
-            if [ "${automatic_run}" = true ]; then
-              echo "Automatic PR checks cover this revision; skipping duplicate manual work."
+              --jq ".workflow_runs | map(select(.status != \"completed\" or .updated_at >= \"${run_created}\")) | sort_by(.updated_at) | last | .html_url // empty")
+            if [ -n "${automatic_run}" ]; then
+              echo "::notice::Skipping duplicate manual checks; automatic PR run: ${automatic_run}"
+              {
+                echo "### Manual checks skipped"
+                echo
+                echo "This run did not execute build or test checks."
+                echo "See the [automatic PR checks](${automatic_run}) for their status and results."
+                echo
+                echo "Use **Re-run all jobs** to execute this manual run explicitly."
+              } >> "${GITHUB_STEP_SUMMARY}"
               run_checks=false
             fi
           fi
