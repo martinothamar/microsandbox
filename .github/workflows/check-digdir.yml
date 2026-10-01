@@ -65,7 +65,7 @@ jobs:
               ;;
           esac
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: ./.github/actions/pinned-rust-toolchain
 
       - name: Check the locked dependency graph
         run: cargo metadata --locked --format-version 1 >/dev/null
@@ -127,7 +127,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: ./.github/actions/pinned-rust-toolchain
         with:
           targets: ${{ matrix.target }}
 
@@ -142,7 +142,7 @@ jobs:
 
       - name: Build agentd
         run: |
-          cargo +stable build --locked --profile ci --manifest-path crates/agentd/Cargo.toml --target ${{ matrix.target }}
+          cargo build --locked --profile ci --manifest-path crates/agentd/Cargo.toml --target ${{ matrix.target }}
           mkdir -p build
           cp target/${{ matrix.target }}/ci/agentd build/agentd
 
@@ -177,7 +177,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: ./.github/actions/pinned-rust-toolchain
 
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
@@ -212,7 +212,7 @@ jobs:
 
       - name: Build msb
         run: |
-          cargo +stable build --locked --profile ci --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli
+          cargo build --locked --profile ci --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli
           cp target/ci/msb build/msb
           build/msb --version
 
@@ -236,7 +236,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: ./.github/actions/pinned-rust-toolchain
 
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
@@ -266,7 +266,7 @@ jobs:
 
       - name: Build and codesign msb
         run: |
-          cargo +stable build --locked --profile ci --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli
+          cargo build --locked --profile ci --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli
           cp target/ci/msb build/msb
           codesign --entitlements msb-entitlements.plist --force -s - build/msb
           build/msb --version
@@ -291,7 +291,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: ./.github/actions/pinned-rust-toolchain
         with:
           components: clippy, rustfmt
           targets: x86_64-unknown-linux-musl
@@ -315,31 +315,31 @@ jobs:
 
       - name: Format
         run: |
-          cargo +stable fmt --all -- --check
-          cargo +stable fmt --manifest-path crates/agentd/Cargo.toml -- --check
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path crates/agentd/Cargo.toml -- --check
 
       - name: Check agentd
-        run: cargo +stable clippy --locked --manifest-path crates/agentd/Cargo.toml --target x86_64-unknown-linux-musl -- -D warnings
+        run: cargo clippy --locked --manifest-path crates/agentd/Cargo.toml --target x86_64-unknown-linux-musl -- -D warnings
 
       - name: Clippy
-        run: cargo +stable clippy --locked --workspace --exclude microsandbox-agentd -- -D warnings
+        run: cargo clippy --locked --workspace --exclude microsandbox-agentd -- -D warnings
 
       # The feature set the embedding application builds the SDK with, and the
       # feature surfaces upstream keeps building without the packet engine.
       - name: Check feature surfaces
         run: |
-          cargo +stable check --locked -p microsandbox --no-default-features --features local,net
-          cargo +stable check --locked -p microsandbox-runtime --no-default-features --features client,net
-          cargo +stable check --locked -p microsandbox-network --no-default-features
-          cargo +stable check --locked -p microsandbox-network --no-default-features --features control
+          cargo check --locked -p microsandbox --no-default-features --features local,net
+          cargo check --locked -p microsandbox-runtime --no-default-features --features client,net
+          cargo check --locked -p microsandbox-network --no-default-features
+          cargo check --locked -p microsandbox-network --no-default-features --features control
 
       - name: Documentation
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo +stable doc --locked --workspace --exclude microsandbox-agentd --no-deps
+        run: cargo doc --locked --workspace --exclude microsandbox-agentd --no-deps
 
       - name: Check generated Microsandbox types
-        run: cargo +stable run --locked -p microsandbox-types --features ts --bin microsandbox-types-generate -- --check
+        run: cargo run --locked -p microsandbox-types --features ts --bin microsandbox-types-generate -- --check
 
   rust-test:
     name: Rust test (${{ matrix.target }})
@@ -395,7 +395,7 @@ jobs:
         shell: pwsh
         run: git submodule update --init --depth 1 vendor/libkrunfw
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: ./.github/actions/pinned-rust-toolchain
         with:
           components: clippy
           targets: ${{ matrix.rust_target }}
@@ -440,7 +440,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
           Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
-          cargo +stable build --locked --profile ci --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli --target ${{ matrix.rust_target }}
+          cargo build --locked --profile ci --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli --target ${{ matrix.rust_target }}
           Copy-Item target\${{ matrix.rust_target }}\ci\msb.exe build\msb.exe -Force
           & build\msb.exe --version
 
@@ -454,7 +454,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
           Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
-          cargo +stable check --locked --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli --target ${{ matrix.rust_target }}
+          cargo check --locked --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli --target ${{ matrix.rust_target }}
 
       - name: Clippy msb
         shell: pwsh
@@ -462,7 +462,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
           Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
-          cargo +stable clippy --locked --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli --target ${{ matrix.rust_target }} -- -D warnings
+          cargo clippy --locked --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli --target ${{ matrix.rust_target }} -- -D warnings
 
       - name: Test bind rootfs backend
         shell: pwsh
@@ -473,7 +473,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
           Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
-          cargo +stable test --locked --no-default-features --features net,runner -p microsandbox-runtime --lib --target ${{ matrix.rust_target }} test_bind_rootfs_backend_exposes_host_file_and_init
+          cargo test --locked --no-default-features --features net,runner -p microsandbox-runtime --lib --target ${{ matrix.rust_target }} test_bind_rootfs_backend_exposes_host_file_and_init
 
       - name: Test bind rootfs patches
         shell: pwsh
@@ -484,7 +484,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
           Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
-          cargo +stable test --locked --no-default-features --features local,net -p microsandbox --lib --target ${{ matrix.rust_target }} sandbox::patch::tests::bind_patch_
+          cargo test --locked --no-default-features --features local,net -p microsandbox --lib --target ${{ matrix.rust_target }} sandbox::patch::tests::bind_patch_
 
       - name: Test Windows lifecycle handoff and stdio cleanup
         shell: pwsh
@@ -495,7 +495,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
           Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
-          cargo +stable test --locked --no-default-features --features local,net -p microsandbox --lib --target ${{ matrix.rust_target }} runtime::spawn::tests::windows_
+          cargo test --locked --no-default-features --features local,net -p microsandbox --lib --target ${{ matrix.rust_target }} runtime::spawn::tests::windows_
 
       - name: Test Windows DNS resolver
         shell: pwsh
@@ -503,4 +503,4 @@ jobs:
           $ErrorActionPreference = "Stop"
           . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
           Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
-          cargo +stable test --locked -p microsandbox-network --lib --target ${{ matrix.rust_target }} dns::upstream::system::windows::
+          cargo test --locked -p microsandbox-network --lib --target ${{ matrix.rust_target }} dns::upstream::system::windows::

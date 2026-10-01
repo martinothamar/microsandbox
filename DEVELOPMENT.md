@@ -228,6 +228,25 @@ See that repository's README for setup, workload descriptions, and usage.
 
 ## Code Quality
 
+### Downstream Rust toolchain
+
+The Digdir patch queue pins Rust in `rust-toolchain.toml`. Local Cargo commands,
+pre-commit hooks, downstream checks, reusable platform tests, and runtime releases
+use that toolchain. CI reports the active Rust, Cargo, and Clippy versions; avoid
+`cargo +stable`, which bypasses the pin.
+
+The current pin is Rust 1.98.1, which passed upstream v0.7.4's
+[Rust Quality job](https://github.com/superradcompany/microsandbox/actions/runs/36161471349/job/108160234023).
+When synchronizing onto a new upstream release, record the exact toolchain from a
+successful upstream quality run and update this pin deliberately. Compare the
+upstream formatting, Clippy, documentation, target, and feature checks at that
+release with the downstream workflows. Preserve their lint settings and
+`-D warnings`; keep `--locked` for downstream dependency reproducibility.
+
+The upstream mirror branch retains upstream's floating `stable` configuration.
+Follow the [downstream maintenance runbook](https://github.com/Altinn/altinn-studio/blob/main/src/experimental/MICROSANDBOX.md)
+when selecting the release base and reviewing the patch queue.
+
 ### Pre-commit Hooks
 
 Pre-commit hooks are installed by `just setup`. They run automatically on every commit and check:

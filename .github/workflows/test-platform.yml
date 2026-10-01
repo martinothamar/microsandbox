@@ -40,7 +40,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: ./.github/actions/pinned-rust-toolchain
 
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
@@ -63,19 +63,19 @@ jobs:
       - name: Test agentd (Linux)
         if: inputs.os == 'linux'
         run: |
-          rustup target add --toolchain stable ${{ inputs.agentd_target }}
-          cargo +stable test --manifest-path crates/agentd/Cargo.toml --target ${{ inputs.agentd_target }}
+          rustup target add ${{ inputs.agentd_target }}
+          cargo test --manifest-path crates/agentd/Cargo.toml --target ${{ inputs.agentd_target }}
 
       - name: Set up mold (Linux host link)
         if: inputs.os == 'linux'
         uses: rui314/setup-mold@10ca16bf91dc22e05ebdc935cad9c75ea248f621 # 2.41.0
 
       - name: Test workspace
-        run: cargo +stable test --workspace --exclude microsandbox-agentd
+        run: cargo test --workspace --exclude microsandbox-agentd
 
       # The macOS resolver goes through mDNSResponder; these tests need the
       # runner's network, so they are ignored in the workspace run above.
       - name: Test macOS system DNS resolver
         if: inputs.os == 'darwin'
         run: |
-          cargo +stable test -p microsandbox-network --lib dns::upstream::system::macos:: -- --include-ignored
+          cargo test -p microsandbox-network --lib dns::upstream::system::macos:: -- --include-ignored
