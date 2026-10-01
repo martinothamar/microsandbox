@@ -247,6 +247,32 @@ The upstream mirror branch retains upstream's floating `stable` configuration.
 Follow the [downstream maintenance runbook](https://github.com/Altinn/altinn-studio/blob/main/src/experimental/MICROSANDBOX.md)
 when selecting the release base and reviewing the patch queue.
 
+### Downstream CI caches and concurrency
+
+`Check Digdir` restores Rust dependency caches in every run but saves them only
+from `main-digdir`, including its reusable platform tests. This keeps large
+PR-specific copies from evicting the integration branch's caches. A new toolchain
+or dependency graph is warmed by the next successful integration-branch run;
+PRs still build normally on a cache miss.
+
+Guest kernel jobs cache the generated `vendor/libkrunfw/kernel.c` bundle by the
+firmware submodule revision, guest architecture, runner image, GCC target and
+version, and linker version. An exact hit skips source preparation and kernel
+compilation; a miss uses the existing build and source-checksum verification.
+Only `main-digdir` saves these bundles, and every run validates and uploads its
+bundle for the host build jobs. Bump the cache recipe version when changing the
+kernel build command or flags. Runtime release jobs continue to build firmware
+from source.
+
+Manual runs skip duplicate work when automatic PR checks for the same revision
+are active or completed after the manual run was requested. PR and manual runs
+use separate concurrency queues so a manual run cannot cancel required PR checks,
+including pending checks. A manual run requested after PR checks finish still
+runs, as do synchronization branches whose PR checks cannot start. A PR triggered
+after the manual selection step can still run alongside that manual build.
+Integration-branch runs retain their existing concurrency behavior so they can
+finish warming caches.
+
 ### Pre-commit Hooks
 
 Pre-commit hooks are installed by `just setup`. They run automatically on every commit and check:

@@ -20,6 +20,11 @@ on:
         required: false
         default: ""
         type: string
+      save_cache:
+        description: Whether this caller should save Rust dependency caches.
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -46,6 +51,7 @@ jobs:
         with:
           cache-bin: false
           cache-targets: true
+          save-if: ${{ inputs.save_cache }}
 
       - name: Install build deps (Linux)
         if: inputs.os == 'linux'
