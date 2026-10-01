@@ -247,6 +247,43 @@ The upstream mirror branch retains upstream's floating `stable` configuration.
 Follow the [downstream maintenance runbook](https://github.com/Altinn/altinn-studio/blob/main/src/experimental/MICROSANDBOX.md)
 when selecting the release base and reviewing the patch queue.
 
+### Downstream CI caches and concurrency
+
+`Check Digdir` attempts to restore Rust dependency caches in every run but saves
+them only from `main-digdir`, including its reusable platform tests. This keeps large
+PR-specific copies from evicting the integration branch's caches. A new toolchain
+or dependency graph is warmed by the next successful integration-branch run;
+PRs still build normally on a cache miss.
+
+Guest kernel jobs cache the generated `vendor/libkrunfw/kernel.c` bundle by the
+firmware submodule revision, guest architecture, runner image, GCC target and
+version, and linker version. An exact hit skips source preparation and kernel
+compilation; a miss uses the existing build and source-checksum verification.
+Only `main-digdir` saves these bundles, and every run validates and uploads its
+bundle for the host build jobs. Bump the cache recipe version when changing the
+kernel build command or flags. Runtime release jobs continue to build firmware
+from source.
+
+PR runs can restore caches saved by their base branch, `main-digdir`. Manual
+`sync/digdir-*` runs cannot access those caches while the repository's default
+branch is `main`: manual runs can restore only their own branch and default-branch
+caches. They cannot reuse warmed integration-branch caches and build normally on
+a miss. Keeping cache saves scoped to the integration branch protects capacity
+for ordinary PRs. These manual checks remain necessary when an upstream synchronization
+rewrites history and its conflicting PR cannot start automatic checks.
+
+The first attempt of a manual run skips duplicate work when automatic PR checks
+for the same revision are active or completed after the manual run was requested.
+A notice and step summary link the covering run and explain that this manual run
+did not execute checks. **Re-run all jobs** always executes manual checks; a new
+manual dispatch after PR checks finish also runs. A PR triggered after the manual
+selection step can still run alongside that manual build.
+
+Concurrency remains grouped by workflow and Git ref. PR merge refs and manual
+branch refs already use separate groups; manual and push runs on `main-digdir`
+share a group. Active integration-branch runs finish so they can warm caches,
+while a newer pending run can replace an older pending run in the same group.
+
 ### Pre-commit Hooks
 
 Pre-commit hooks are installed by `just setup`. They run automatically on every commit and check:

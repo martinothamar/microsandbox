@@ -27,8 +27,49 @@ env:
   LIBKRUNFW_ABI: "5"
 
 jobs:
+  select-run:
+    name: Select CI run
+    permissions:
+      actions: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run-checks: ${{ steps.select.outputs.run-checks }}
+    steps:
+      - name: Prefer automatic PR checks
+        id: select
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_EVENT: ${{ github.event_name }}
+          CI_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          run_checks=true
+          if [ "${CI_EVENT}" = workflow_dispatch ] && [ "${CI_ATTEMPT}" = 1 ]; then
+            run_created=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq .created_at)
+            automatic_run=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/check-digdir.yml/runs?event=pull_request&head_sha=${GITHUB_SHA}&per_page=100" \
+              --jq ".workflow_runs | map(select(.status != \"completed\" or .updated_at >= \"${run_created}\")) | sort_by(.updated_at) | last | .html_url // empty")
+            if [ -n "${automatic_run}" ]; then
+              echo "::notice::Skipping duplicate manual checks; automatic PR run: ${automatic_run}"
+              {
+                echo "### Manual checks skipped"
+                echo
+                echo "This run did not execute build or test checks."
+                echo "See the [automatic PR checks](${automatic_run}) for their status and results."
+                echo
+                echo "Use **Re-run all jobs** to execute this manual run explicitly."
+              } >> "${GITHUB_STEP_SUMMARY}"
+              run_checks=false
+            fi
+          fi
+          echo "run-checks=${run_checks}" >> "${GITHUB_OUTPUT}"
+
   validate:
     name: Validate downstream source
+    needs: select-run
+    if: needs.select-run.outputs.run-checks == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -95,12 +136,50 @@ jobs:
       - name: Install kernel build dependencies
         run: sudo apt-get update && sudo apt-get install -y bc bison flex gcc libelf-dev make python3-pyelftools
 
+      - name: Resolve kernel bundle cache key
+        id: kernel-bundle
+        shell: bash
+        env:
+          KERNEL_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          firmware_revision=$(git -C vendor/libkrunfw rev-parse HEAD)
+          builder_id=$(
+            {
+              printf '%s\n' "${ImageOS}" "${ImageVersion}"
+              gcc -dumpmachine &&
+                gcc -dumpfullversion -dumpversion &&
+                ld --version
+            } | sha256sum | cut -d ' ' -f 1
+          )
+          # Bump v1 when changing the kernel build command or flags below.
+          echo "key=digdir-kernel-bundle-v1-${KERNEL_ARCH}-${firmware_revision}-${builder_id}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore kernel firmware bundle
+        id: kernel-bundle-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vendor/libkrunfw/kernel.c
+          key: ${{ steps.kernel-bundle.outputs.key }}
+
       - name: Prepare kernel source
+        if: steps.kernel-bundle-cache.outputs.cache-hit != 'true'
         uses: ./.github/actions/cache-libkrunfw-kernel
 
       - name: Build kernel firmware bundle
+        if: steps.kernel-bundle-cache.outputs.cache-hit != 'true'
         working-directory: vendor/libkrunfw
         run: make -j"$(nproc)" kernel.c
+
+      - name: Validate kernel firmware bundle
+        run: test -s vendor/libkrunfw/kernel.c
+
+      - name: Save kernel firmware bundle
+        if: github.ref == 'refs/heads/main-digdir' && steps.kernel-bundle-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vendor/libkrunfw/kernel.c
+          key: ${{ steps.kernel-bundle.outputs.key }}
 
       - name: Upload kernel firmware bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -135,6 +214,7 @@ jobs:
         with:
           cache-bin: false
           cache-targets: true
+          save-if: ${{ github.ref == 'refs/heads/main-digdir' }}
           shared-key: digdir-agentd-${{ matrix.arch }}
 
       - name: Install musl build dependencies
@@ -183,6 +263,7 @@ jobs:
         with:
           cache-bin: false
           cache-targets: true
+          save-if: ${{ github.ref == 'refs/heads/main-digdir' }}
           shared-key: digdir-runtime-${{ matrix.target }}
 
       - name: Install build dependencies
@@ -242,6 +323,7 @@ jobs:
         with:
           cache-bin: false
           cache-targets: true
+          save-if: ${{ github.ref == 'refs/heads/main-digdir' }}
           shared-key: digdir-runtime-darwin-aarch64
 
       - name: Download guest agent
@@ -300,6 +382,7 @@ jobs:
         with:
           cache-bin: false
           cache-targets: true
+          save-if: ${{ github.ref == 'refs/heads/main-digdir' }}
           shared-key: digdir-rust-quality
 
       - name: Install build dependencies
@@ -366,6 +449,7 @@ jobs:
       runner: ${{ matrix.runner }}
       os: ${{ matrix.os }}
       agentd_target: ${{ matrix.agentd_target }}
+      save_cache: ${{ github.ref == 'refs/heads/main-digdir' }}
 
   windows:
     name: Rust runtime and tests (${{ matrix.target }})
@@ -404,6 +488,7 @@ jobs:
         with:
           cache-bin: false
           cache-targets: true
+          save-if: ${{ github.ref == 'refs/heads/main-digdir' }}
           shared-key: digdir-windows-${{ matrix.target }}
 
       - name: Download kernel firmware bundle
