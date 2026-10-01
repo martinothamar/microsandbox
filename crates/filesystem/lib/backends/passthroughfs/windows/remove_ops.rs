@@ -105,16 +105,13 @@ impl PassthroughFs {
         let moved = inodes
             .by_path
             .iter()
-            .filter(|(path, _)| {
-                path.as_path() == old_path
-                    || (self.cfg.owned_checkpoint.is_some() && path.starts_with(old_path))
-            })
+            .filter(|(path, _)| path.starts_with(old_path))
             .map(|(path, data)| (path.clone(), data.clone()))
             .collect::<Vec<_>>();
         for (path, data) in moved {
             inodes.by_path.remove(&path);
-            // Owned state records current child paths, including cached descendants of
-            // a renamed directory. An unrelated destination inode keeps its retained pin.
+            // Cached descendants must follow directory renames on shared and owned mounts.
+            // An unrelated destination inode keeps its retained pin.
             let path = renamed_inode_path(&path, old_path, new_path);
             let canonical = data.path();
             if canonical.starts_with(old_path) {

@@ -638,6 +638,81 @@ fn readonly_rejects_mutation() {
 }
 
 #[test]
+fn shared_directory_rename_preserves_cached_descendants() {
+    let temp = TempDir::new();
+    std::fs::create_dir_all(temp.path.join("directory/inner")).unwrap();
+    std::fs::write(temp.path.join("directory/inner/file"), b"child").unwrap();
+    std::fs::create_dir(temp.path.join("directory-other")).unwrap();
+    std::fs::write(temp.path.join("directory-other/file"), b"neighbor").unwrap();
+    std::fs::create_dir(temp.path.join("destination")).unwrap();
+    let fs = fs_for(&temp.path);
+    assert!(fs.cfg.owned_checkpoint.is_none());
+    let directory = fs
+        .lookup(context(), ROOT_INODE, c"directory")
+        .unwrap()
+        .inode;
+    let inner = fs.lookup(context(), directory, c"inner").unwrap().inode;
+    let child = fs.lookup(context(), inner, c"file").unwrap().inode;
+    let neighbor_directory = fs
+        .lookup(context(), ROOT_INODE, c"directory-other")
+        .unwrap()
+        .inode;
+    let neighbor = fs
+        .lookup(context(), neighbor_directory, c"file")
+        .unwrap()
+        .inode;
+    let destination = fs
+        .lookup(context(), ROOT_INODE, c"destination")
+        .unwrap()
+        .inode;
+
+    for (old_parent, old_name, new_parent, new_name, host_directory) in [
+        (
+            ROOT_INODE,
+            c"directory",
+            destination,
+            c"moved",
+            "destination/moved",
+        ),
+        (destination, c"moved", ROOT_INODE, c"returned", "returned"),
+    ] {
+        fs.rename(context(), old_parent, old_name, new_parent, new_name, 0)
+            .unwrap();
+        assert_eq!(fs.getattr(context(), child, None).unwrap().0.st_size, 5);
+        let moved = fs.lookup(context(), new_parent, new_name).unwrap();
+        assert_eq!(moved.inode, directory);
+        assert_eq!(
+            fs.lookup(context(), moved.inode, c"inner").unwrap().inode,
+            inner
+        );
+        assert_eq!(fs.lookup(context(), inner, c"file").unwrap().inode, child);
+        let handle = fs.open(context(), child, false, 0).unwrap().0.unwrap();
+        let mut writer = CaptureWriter { bytes: Vec::new() };
+        fs.read(context(), child, handle, &mut writer, 32, 0, None, 0)
+            .unwrap();
+        assert_eq!(writer.bytes, b"child");
+        fs.release(context(), child, 0, handle, false, false, None)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(temp.path.join(host_directory).join("inner/file")).unwrap(),
+            b"child"
+        );
+        assert_eq!(
+            fs.lookup(context(), neighbor_directory, c"file")
+                .unwrap()
+                .inode,
+            neighbor
+        );
+        assert_eq!(fs.getattr(context(), neighbor, None).unwrap().0.st_size, 8);
+        assert_eq!(
+            std::fs::read(temp.path.join("directory-other/file")).unwrap(),
+            b"neighbor"
+        );
+        expect_errno(fs.lookup(context(), old_parent, old_name), LINUX_ENOENT);
+    }
+}
+
+#[test]
 fn heartbeat_style_rename_keeps_source_inode_usable() {
     let temp = TempDir::new();
     std::fs::write(temp.path.join("heartbeat.json"), b"old").unwrap();
