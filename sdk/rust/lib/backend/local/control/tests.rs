@@ -6,15 +6,34 @@ use super::identity::DatabaseIdentity;
 // Tests
 //--------------------------------------------------------------------------------------------------
 
-#[test]
-fn database_identity_detects_replacement_but_not_ordinary_writes() {
+#[tokio::test]
+async fn database_identity_detects_replacement_but_not_ordinary_writes() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("database");
-    std::fs::write(&path, b"original").unwrap();
-    let identity = DatabaseIdentity::capture(&path).unwrap();
-    std::fs::write(&path, b"updated contents").unwrap();
+    use sea_orm::ConnectionTrait;
+    let pools = microsandbox_db::pool::DbPools::open(
+        &path,
+        1,
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let identity = DatabaseIdentity::capture(&path).await.unwrap();
+    pools
+        .write()
+        .execute_unprepared("CREATE TABLE ordinary_write (value INTEGER)")
+        .await
+        .unwrap();
     identity.verify().unwrap();
-    std::fs::rename(&path, directory.path().join("old")).unwrap();
+    // The identity must keep the inode alive after all ordinary pools close.
+    pools.read().inner().close_by_ref().await.unwrap();
+    pools.write().inner().close_by_ref().await.unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert!(matches!(
+        identity.verify(),
+        Err(microsandbox_control_client::ControlClientError::RuntimeChanged)
+    ));
     std::fs::write(&path, b"replacement").unwrap();
     assert!(matches!(
         identity.verify(),
