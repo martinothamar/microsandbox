@@ -464,6 +464,16 @@ jobs:
           Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
           cargo clippy --locked --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli --target ${{ matrix.rust_target }} -- -D warnings
 
+      - name: Test Windows passthrough rename
+        shell: pwsh
+        env:
+          MSB_AGENTD_PATH: ${{ github.workspace }}/build/agentd
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
+          cargo test --locked --no-default-features -p microsandbox-filesystem --lib --target ${{ matrix.rust_target }} rename
+
       - name: Test bind rootfs backend
         shell: pwsh
         # Tests build without embed-binaries and take the guest agent from this override.
