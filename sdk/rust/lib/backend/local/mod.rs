@@ -162,6 +162,7 @@ impl LocalBackend {
                 .await?;
                 self.control_sessions
                     .bind_database(&db_dir.join(microsandbox_utils::DB_FILENAME))
+                    .await
                     .map_err(MicrosandboxError::ControlClient)?;
                 Ok(pools)
             })

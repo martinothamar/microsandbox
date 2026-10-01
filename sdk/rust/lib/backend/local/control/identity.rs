@@ -1,5 +1,6 @@
 //! OS identity without any new runtime handshake field or persisted schema.
 
+#[cfg(any(not(unix), target_os = "linux"))]
 use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -12,6 +13,8 @@ use std::path::{Path, PathBuf};
 #[cfg(not(any(target_os = "macos", windows)))]
 use microsandbox_control_client::ErrorKind;
 use microsandbox_control_client::{ClientError, ControlClientError, ControlClientResult};
+#[cfg(unix)]
+use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{FILETIME, WAIT_TIMEOUT},
@@ -41,8 +44,14 @@ pub(super) struct ProcessIdentity {
 pub(super) struct DatabaseIdentity {
     path: PathBuf,
     id: (u64, u64, u64),
-    // Keep the original object alive so an unlinked inode/file ID cannot be
-    // recycled and mistaken for this backend's database.
+    // Pin the original inode through SQLite itself. Closing a raw descriptor,
+    // even on capture failure or backend teardown, releases every POSIX lock
+    // this process holds on that file. SQLite coordinates its own closes with
+    // all other connections, including pools that outlive the backend.
+    #[cfg(unix)]
+    _connection: SqliteConnection,
+    // Windows file IDs and locking retain their existing handle semantics.
+    #[cfg(not(unix))]
     _file: File,
 }
 
@@ -143,19 +152,61 @@ impl ProcessIdentity {
 }
 
 impl DatabaseIdentity {
-    pub fn capture(path: impl AsRef<Path>) -> ControlClientResult<Self> {
-        let file = File::open(path.as_ref()).map_err(ClientError::from)?;
-        let id = file_id(&file)?;
-        Ok(Self {
-            path: path.as_ref().to_owned(),
-            id,
-            _file: file,
-        })
+    pub async fn capture(path: impl AsRef<Path>) -> ControlClientResult<Self> {
+        let path = path.as_ref();
+        #[cfg(unix)]
+        {
+            let metadata = std::fs::metadata(path).map_err(ClientError::from)?;
+            let id = (metadata.dev(), metadata.ino(), 0);
+            let options = SqliteConnectOptions::new()
+                .filename(path)
+                .read_only(true)
+                .create_if_missing(false);
+            let mut connection = SqliteConnection::connect_with(&options)
+                .await
+                .map_err(database_lookup_error)?;
+            // Read the schema so SQLite opens and retains the catalog inode.
+            // No transaction remains open, so this does not hold a WAL reader
+            // snapshot or prevent checkpointing while the backend is alive.
+            sqlx::query("PRAGMA schema_version")
+                .fetch_one(&mut connection)
+                .await
+                .map_err(database_lookup_error)?;
+            let identity = Self {
+                path: path.to_owned(),
+                id,
+                _connection: connection,
+            };
+            // Reject replacement across capture without a raw open/close.
+            identity.verify()?;
+            Ok(identity)
+        }
+        #[cfg(not(unix))]
+        {
+            let file = File::open(path).map_err(ClientError::from)?;
+            let id = file_id(&file)?;
+            Ok(Self {
+                path: path.to_owned(),
+                id,
+                _file: file,
+            })
+        }
     }
 
     pub fn verify(&self) -> ControlClientResult<()> {
-        let current = File::open(&self.path).map_err(|_| ControlClientError::RuntimeChanged)?;
-        if file_id(&current)? != self.id {
+        #[cfg(unix)]
+        let current_id = {
+            // stat() never closes a catalog descriptor or releases SQLite locks.
+            let metadata =
+                std::fs::metadata(&self.path).map_err(|_| ControlClientError::RuntimeChanged)?;
+            (metadata.dev(), metadata.ino(), 0)
+        };
+        #[cfg(not(unix))]
+        let current_id = {
+            let current = File::open(&self.path).map_err(|_| ControlClientError::RuntimeChanged)?;
+            file_id(&current)?
+        };
+        if current_id != self.id {
             return Err(ControlClientError::RuntimeChanged);
         }
         Ok(())
@@ -258,12 +309,13 @@ fn windows_start(handle: &OwnedHandle) -> ControlClientResult<ProcessStart> {
     ))
 }
 
+#[cfg(unix)]
+fn database_lookup_error(error: sqlx::Error) -> ControlClientError {
+    ClientError::from(std::io::Error::other(error)).into()
+}
+
+#[cfg(not(unix))]
 fn file_id(file: &File) -> ControlClientResult<(u64, u64, u64)> {
-    #[cfg(unix)]
-    {
-        let metadata = file.metadata().map_err(ClientError::from)?;
-        Ok((metadata.dev(), metadata.ino(), 0))
-    }
     #[cfg(windows)]
     {
         let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();

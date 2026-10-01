@@ -1,6 +1,8 @@
 //! Backend-owned, identity-verified runtime control sessions.
 
 #[cfg(all(test, unix))]
+mod catalog_tests;
+#[cfg(all(test, unix))]
 mod delivery_tests;
 mod identity;
 #[cfg(all(test, unix))]

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, Weak};
 use microsandbox_control_client::{
     ClientError, ControlClientError, ControlConnection, ErrorKind, VerifiedControlConnector,
 };
-use tokio::sync::Notify;
+use tokio::sync::{Notify, OnceCell};
 use tokio_util::sync::CancellationToken;
 
 use super::identity::{DatabaseIdentity, ProcessStart};
@@ -36,7 +36,7 @@ type Entries = Mutex<HashMap<RuntimeKey, Arc<Entry>>>;
 
 pub(crate) struct ControlSessions {
     entries: Arc<Entries>,
-    database: Mutex<Option<Arc<DatabaseIdentity>>>,
+    database: OnceCell<Arc<DatabaseIdentity>>,
     limit: usize,
 }
 
@@ -62,14 +62,16 @@ struct Waiter(Arc<Entry>);
 
 impl ControlSessions {
     /// Called when this backend opens its database, not each time a path is reused.
-    pub fn bind_database(&self, path: &Path) -> Result<(), SharedError> {
-        let identity = Arc::new(DatabaseIdentity::capture(path).map_err(Arc::new)?);
+    pub async fn bind_database(&self, path: &Path) -> Result<(), SharedError> {
         let existing = self
             .database
-            .lock()
-            .unwrap()
-            .get_or_insert(identity)
-            .clone();
+            .get_or_try_init(|| async {
+                DatabaseIdentity::capture(path)
+                    .await
+                    .map(Arc::new)
+                    .map_err(Arc::new)
+            })
+            .await?;
         existing.verify().map_err(Arc::new)?;
         Ok(())
     }
@@ -82,7 +84,7 @@ impl ControlSessions {
     }
 
     pub(super) fn database(&self) -> Result<Arc<DatabaseIdentity>, SharedError> {
-        let database = self.database.lock().unwrap().clone().ok_or_else(changed)?;
+        let database = self.database.get().cloned().ok_or_else(changed)?;
         if let Err(error) = database.verify() {
             self.invalidate_all();
             return Err(Arc::new(error));
@@ -278,7 +280,7 @@ impl Default for ControlSessions {
     fn default() -> Self {
         Self {
             entries: Arc::new(Mutex::new(HashMap::new())),
-            database: Mutex::new(None),
+            database: OnceCell::new(),
             limit: MAX_SESSIONS,
         }
     }
