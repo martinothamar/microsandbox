@@ -29,7 +29,12 @@ async fn database_identity_detects_replacement_but_not_ordinary_writes() {
     // The identity must keep the inode alive after all ordinary pools close.
     pools.read().inner().close_by_ref().await.unwrap();
     pools.write().inner().close_by_ref().await.unwrap();
-    std::fs::remove_file(&path).unwrap();
+    let original = directory.path().join("original");
+    std::fs::rename(&path, &original).unwrap();
+    // Unix can unlink the pinned inode. Windows retains a delete-pending name
+    // until its last handle closes, so replacement uses the renamed path.
+    #[cfg(unix)]
+    std::fs::remove_file(&original).unwrap();
     assert!(matches!(
         identity.verify(),
         Err(microsandbox_control_client::ControlClientError::RuntimeChanged)
